@@ -57,6 +57,8 @@ export type BackendFlowNode =
         agent_binding: { agent_id: string; agent_version?: number | null };
         input_mapping: Record<string, unknown>;
         output_mapping: Record<string, unknown>;
+        max_retry?: number;
+        on_fail?: string | null;
       };
     }
   | {
@@ -70,6 +72,8 @@ export type BackendFlowNode =
         strategy: "parallel" | "sequential";
         input_mapping: Record<string, unknown>;
         output_mapping: Record<string, unknown>;
+        max_retry?: number;
+        on_fail?: string | null;
       };
     }
   | {
@@ -141,6 +145,11 @@ export type BackendRunDetail = {
   }>;
 };
 
+export type BackendRunStreamEvent = {
+  event: string;
+  data: Record<string, unknown>;
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
@@ -210,6 +219,70 @@ export async function runBackendFlow(flowId: string, input: Record<string, unkno
     body: JSON.stringify({ input }),
   });
   return request<BackendRunDetail>(`/runs/${summary.id}`);
+}
+
+async function streamBackendRun(
+  path: string,
+  input: Record<string, unknown>,
+  onEvent: (event: BackendRunStreamEvent) => void,
+) {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    },
+    body: JSON.stringify({ input, stream: true }),
+  });
+
+  if (!response.ok || !response.body) {
+    throw new Error("stream request failed");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split("\n\n");
+    buffer = chunks.pop() ?? "";
+
+    chunks.forEach((chunk) => {
+      const eventLine = chunk.split("\n").find((line) => line.startsWith("event:"));
+      const dataLine = chunk.split("\n").find((line) => line.startsWith("data:"));
+
+      if (!eventLine || !dataLine) {
+        return;
+      }
+
+      onEvent({
+        event: eventLine.replace("event:", "").trim(),
+        data: JSON.parse(dataLine.replace("data:", "").trim()) as Record<string, unknown>,
+      });
+    });
+  }
+}
+
+export function streamBackendFlowRun(
+  flowId: string,
+  input: Record<string, unknown>,
+  onEvent: (event: BackendRunStreamEvent) => void,
+) {
+  return streamBackendRun(`/flows/${flowId}/runs/stream`, input, onEvent);
+}
+
+export function streamBackendAgentRun(
+  agentId: string,
+  input: Record<string, unknown>,
+  onEvent: (event: BackendRunStreamEvent) => void,
+) {
+  return streamBackendRun(`/agents/${agentId}/runs/stream`, input, onEvent);
 }
 
 export { API_BASE_URL };

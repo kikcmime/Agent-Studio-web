@@ -744,20 +744,23 @@ button {
 
 .flow-editor-shell {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) clamp(320px, 22vw, 380px);
-  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) clamp(270px, 18vw, 306px);
+  gap: 10px;
+  align-items: stretch;
   min-height: 0;
   height: 100%;
 }
 
 .flow-editor-panel {
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   align-content: start;
-  gap: 10px;
+  gap: 5px;
   min-width: 0;
-  padding: 14px;
+  height: 100%;
+  padding: 7px;
   border: 1px solid rgba(54, 65, 83, 0.08);
-  border-radius: 16px;
+  border-radius: 13px;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.86), rgba(248, 251, 255, 0.72)),
     rgba(255, 255, 255, 0.72);
@@ -766,14 +769,48 @@ button {
   max-height: 100%;
 }
 
+.config-panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.config-panel-scroll {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(116, 132, 158, 0.3) transparent;
+}
+
+.config-panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 0 1px 1px;
+}
+
+.config-panel-head span {
+  overflow: hidden;
+  max-width: 190px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .flow-editor-panel strong {
-  font-size: 12px;
+  font-size: 10px;
 }
 
 .flow-editor-panel span {
   color: var(--muted);
-  font-size: 11px;
-  line-height: 1.5;
+  font-size: 9px;
+  line-height: 1.2;
 }
 
 .flow-node-chip {
@@ -851,6 +888,12 @@ button {
 .flow-editor-canvas .react-flow__edge-path {
   stroke: var(--flow-line);
   stroke-width: 1.35;
+}
+
+.flow-editor-canvas .react-flow__edge.flow-edge-failure .react-flow__edge-path {
+  stroke: #dc6b6b;
+  stroke-dasharray: 7 6;
+  stroke-width: 1.6;
 }
 
 .flow-editor-canvas .react-flow__connection-path {
@@ -1156,47 +1199,61 @@ button {
 .flow-field-compact textarea {
   width: 100%;
   border: 1px solid rgba(54, 65, 83, 0.12);
-  border-radius: 10px;
-  padding: 10px 12px;
+  min-height: 25px;
+  border-radius: 7px;
+  padding: 3px 6px;
   background: rgba(250, 250, 248, 0.9);
   color: var(--text);
   font: inherit;
+  font-size: 11px;
+  line-height: 1.22;
   resize: vertical;
+}
+
+.flow-field-compact textarea {
+  min-height: 38px;
+  max-height: 64px;
+}
+
+.node-compact-row {
+  display: grid;
+  gap: 3px;
+  padding: 4px;
+  border: 1px solid rgba(54, 65, 83, 0.06);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.48);
 }
 
 .agent-config-form {
   display: grid;
-  gap: 10px;
-  max-height: 360px;
-  overflow: auto;
-  margin: 0 -4px;
-  padding: 0 4px 2px;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(116, 132, 158, 0.3) transparent;
+  gap: 4px;
+  overflow: visible;
+  margin: 0;
+  padding: 0;
 }
 
 .agent-config-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(92px, 0.46fr);
-  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) minmax(74px, 0.42fr);
+  gap: 4px;
 }
 
 .agent-config-toggles {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 4px;
 }
 
 .agent-config-toggles label {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 9px;
+  gap: 4px;
+  padding: 2px 6px;
   border: 1px solid rgba(116, 132, 158, 0.14);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.72);
   color: #536074;
-  font-size: 11px;
+  font-size: 10px;
 }
 
 .agent-config-toggles input {
@@ -1205,24 +1262,129 @@ button {
 
 .agent-save-button {
   width: 100%;
-  margin-top: 2px;
-  min-height: 34px;
+  margin-top: 1px;
+  min-height: 25px;
 }
 
 .team-config-card {
   display: grid;
-  gap: 10px;
-  padding: 10px;
+  gap: 4px;
+  padding: 5px;
   border: 1px solid rgba(55, 160, 190, 0.12);
-  border-radius: 14px;
+  border-radius: 10px;
   background: rgba(239, 251, 255, 0.46);
 }
 
 .team-config-card p {
-  margin: 6px 0 0;
+  margin: 2px 0 0;
   color: var(--muted);
-  font-size: 11px;
-  line-height: 1.55;
+  font-size: 9px;
+  line-height: 1.25;
+}
+
+.retry-config-card {
+  display: grid;
+  gap: 4px;
+  padding: 5px;
+  border: 1px solid rgba(220, 107, 107, 0.14);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgba(255, 248, 248, 0.88), rgba(255, 255, 255, 0.72)),
+    #fff;
+}
+
+.config-section-title {
+  display: grid;
+  gap: 1px;
+}
+
+.config-section-title span {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.2;
+}
+
+.run-console {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  flex: 1 1 112px;
+  min-height: 112px;
+  gap: 4px;
+  padding: 5px;
+  border: 1px solid rgba(54, 65, 83, 0.1);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgba(248, 251, 255, 0.88), rgba(255, 255, 255, 0.76)),
+    #fff;
+}
+
+.run-console-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.run-console-header div:first-child {
+  display: grid;
+  gap: 1px;
+}
+
+.run-console-header span,
+.run-console-result span,
+.run-console-event span {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.run-console-light {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: #cbd5e1;
+  box-shadow: 0 0 0 4px rgba(203, 213, 225, 0.18);
+}
+
+.run-console-light.is-running {
+  background: #34d399;
+  box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.16), 0 0 18px rgba(52, 211, 153, 0.5);
+}
+
+.run-console-feed {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  max-height: none;
+  min-height: 0;
+  overflow: auto;
+}
+
+.run-console-feed p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.run-console-event,
+.run-console-result {
+  display: grid;
+  gap: 3px;
+  padding: 4px;
+  border: 1px solid rgba(116, 132, 158, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.run-console-event pre,
+.run-console-result pre {
+  max-height: 58px;
+  margin: 0;
+  overflow: auto;
+  color: #334155;
+  font-size: 9px;
+  line-height: 1.35;
+  white-space: pre-wrap;
 }
 
 .flow-inline-alert {
@@ -1320,13 +1482,23 @@ button {
   margin-top: 14px;
 }
 
+.flow-field-compact {
+  gap: 3px;
+  margin-top: 0;
+}
+
 .flow-field span {
   font-size: 12px;
   color: var(--muted);
 }
 
-.flow-field input,
-.flow-field textarea {
+.flow-field-compact span {
+  font-size: 9px;
+  line-height: 1.15;
+}
+
+.flow-field:not(.flow-field-compact) input,
+.flow-field:not(.flow-field-compact) textarea {
   width: 100%;
   border: 1px solid rgba(54, 65, 83, 0.12);
   border-radius: 12px;

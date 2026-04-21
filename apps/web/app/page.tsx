@@ -35,6 +35,7 @@ import {
   listBackendAgents,
   listBackendFlows,
   runBackendFlow,
+  streamBackendFlowRun,
   updateBackendAgent,
   type BackendAgent,
   type BackendAgentDetail,
@@ -42,6 +43,7 @@ import {
   type BackendFlowDefinition,
   type BackendFlowNode,
   type BackendRunDetail,
+  type BackendRunStreamEvent,
 } from "../features/flow/model/flow-api";
 
 type AppId = "home" | "flow" | "agents" | "skills" | "knowledge" | "mcp";
@@ -163,6 +165,8 @@ type StudioNodeData = {
   teamDescription?: string;
   teamStrategy?: "parallel" | "sequential";
   memberAgentIds?: string[];
+  maxRetry?: number;
+  onFail?: string;
 };
 
 type StudioFlowNode = Node<StudioNodeData>;
@@ -335,6 +339,8 @@ const backendNodeToStudioNode = (node: BackendFlowNode): Node<StudioNodeData> =>
         label: node.data.label,
         agentName: node.data.label,
         agentId: node.data.agent_binding.agent_id,
+        maxRetry: node.data.max_retry ?? 0,
+        onFail: node.data.on_fail ?? "",
       },
       style: getNodeStyle("agent"),
     };
@@ -351,6 +357,8 @@ const backendNodeToStudioNode = (node: BackendFlowNode): Node<StudioNodeData> =>
         teamDescription: node.data.description ?? "",
         teamStrategy: node.data.strategy,
         memberAgentIds: node.data.member_agent_ids,
+        maxRetry: node.data.max_retry ?? 0,
+        onFail: node.data.on_fail ?? "",
       },
       style: getNodeStyle("team"),
     };
@@ -386,6 +394,8 @@ const createEdgesFromDefinition = (definition: BackendFlowDefinition): Edge[] =>
     sourceHandle: edge.source_handle ?? undefined,
     targetHandle: edge.target_handle ?? undefined,
     data: edge.data,
+    animated: edge.data?.branch === "failure",
+    className: edge.data?.branch === "failure" ? "flow-edge-failure" : undefined,
   }));
 
 const nodesToBackendDefinition = (nodes: Node<StudioNodeData>[], edges: Edge[]): BackendFlowDefinition => ({
@@ -400,6 +410,8 @@ const nodesToBackendDefinition = (nodes: Node<StudioNodeData>[], edges: Edge[]):
           agent_binding: { agent_id: node.data.agentId ?? "" },
           input_mapping: { user_message: "{{input.user_message}}" },
           output_mapping: { result: "{{output}}" },
+          max_retry: node.data.maxRetry ?? 0,
+          on_fail: node.data.onFail || null,
         },
       };
     }
@@ -416,6 +428,8 @@ const nodesToBackendDefinition = (nodes: Node<StudioNodeData>[], edges: Edge[]):
           strategy: node.data.teamStrategy ?? "parallel",
           input_mapping: { user_message: "{{input.user_message}}" },
           output_mapping: { result: "{{output}}" },
+          max_retry: node.data.maxRetry ?? 0,
+          on_fail: node.data.onFail || null,
         },
       };
     }
@@ -736,6 +750,47 @@ function FlowCanvas(props: {
   );
 }
 
+function RunConsole(props: {
+  title: string;
+  isRunning: boolean;
+  events: BackendRunStreamEvent[];
+  result: BackendRunDetail | null;
+}) {
+  const lastEvent = props.events.at(-1);
+
+  return (
+    <div className="run-console">
+      <div className="run-console-header">
+        <div>
+          <strong>{props.title}</strong>
+          <span>{props.isRunning ? "Streaming..." : lastEvent ? lastEvent.event : "等待运行"}</span>
+        </div>
+        <div className={`run-console-light ${props.isRunning ? "is-running" : ""}`} />
+      </div>
+
+      <div className="run-console-feed">
+        {props.events.length === 0 ? (
+          <p>点击运行后，这里会显示 run / step / tool / token 等事件流。</p>
+        ) : (
+          props.events.map((item, index) => (
+            <div key={`${item.event}_${index}`} className="run-console-event">
+              <span>{item.event}</span>
+              <pre>{JSON.stringify(item.data, null, 2)}</pre>
+            </div>
+          ))
+        )}
+      </div>
+
+      {props.result ? (
+        <div className="run-console-result">
+          <span>Final Output</span>
+          <pre>{JSON.stringify(props.result.output, null, 2)}</pre>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function FlowStudioContent() {
   const [flows, setFlows] = useState<FlowRecord[]>([]);
   const [selectedFlowId, setSelectedFlowId] = useState<string>(() => readQueryParam("flow") ?? "");
@@ -752,6 +807,8 @@ function FlowStudioContent() {
   const [flowError, setFlowError] = useState<string>("");
   const [isFlowLoading, setIsFlowLoading] = useState(false);
   const [runResult, setRunResult] = useState<BackendRunDetail | null>(null);
+  const [runEvents, setRunEvents] = useState<BackendRunStreamEvent[]>([]);
+  const [isRunStreaming, setIsRunStreaming] = useState(false);
   const [runInputText] = useState('{"user_message":"帮我处理这个问题"}');
   const [nodeSelectorAnchor, setNodeSelectorAnchor] = useState<{ sourceNodeId: string; x: number; y: number } | null>(null);
   const [selectedAgentDetail, setSelectedAgentDetail] = useState<BackendAgentDetail | null>(null);
@@ -830,6 +887,7 @@ function FlowStudioContent() {
     setSelectedNodeId(initialAgentNode);
     setFocusNodeId(initialAgentNode);
     setRunResult(null);
+    setRunEvents([]);
   }, [selectedFlow?.id, setEdges, setNodes]);
 
   useEffect(() => {
@@ -877,7 +935,39 @@ function FlowStudioContent() {
   }, [agentForm, selectedAgentId]);
 
   const onConnect = (connection: Connection) => {
-    setEdges((current) => addEdge({ ...connection, animated: false }, current));
+    const sourceNode = nodes.find((node) => node.id === connection.source);
+    const targetNode = nodes.find((node) => node.id === connection.target);
+    const isFailureBackflow = Boolean(sourceNode && targetNode && targetNode.position.x <= sourceNode.position.x);
+
+    setEdges((current) =>
+      addEdge(
+        {
+          ...connection,
+          animated: isFailureBackflow,
+          className: isFailureBackflow ? "flow-edge-failure" : undefined,
+          data: isFailureBackflow ? { branch: "failure" } : { branch: "success" },
+        },
+        current,
+      ),
+    );
+
+    if (isFailureBackflow && connection.source && connection.target) {
+      setNodes((current) =>
+        current.map((node) =>
+          node.id === connection.source
+            ? {
+                ...node,
+                data: {
+                  ...node.data,
+                  onFail: connection.target ?? undefined,
+                  maxRetry: node.data.maxRetry ?? 3,
+                },
+              }
+            : node,
+        ),
+      );
+      setCanvasNotice("已创建失败回流线");
+    }
   };
 
   const addNode = (kind: FlowStudioNodeKind, sourceNodeId?: string) => {
@@ -928,6 +1018,7 @@ function FlowStudioContent() {
             source: sourceNodeId,
             target: id,
             animated: false,
+            data: { branch: "success" },
           },
           current,
         ),
@@ -1098,15 +1189,29 @@ function FlowStudioContent() {
     }
 
     setRunResult(null);
+    setRunEvents([]);
     setFlowError("");
+    setIsRunStreaming(true);
 
     try {
       const input = JSON.parse(runInputText) as Record<string, unknown>;
-      const result = await runBackendFlow(selectedFlow.id, input);
+      let streamedResult: BackendRunDetail | null = null;
+
+      await streamBackendFlowRun(selectedFlow.id, input, (event) => {
+        setRunEvents((current) => [...current, event]);
+
+        if (event.event === "run.completed") {
+          streamedResult = event.data as unknown as BackendRunDetail;
+        }
+      });
+
+      const result = streamedResult ?? (await runBackendFlow(selectedFlow.id, input));
       setRunResult(result);
       setCanvasNotice(`运行完成：${result.status}`);
     } catch (error) {
       setFlowError(error instanceof Error ? error.message : "运行调试失败");
+    } finally {
+      setIsRunStreaming(false);
     }
   };
 
@@ -1130,7 +1235,7 @@ function FlowStudioContent() {
                 新建 Flow
               </button>
               <button type="button" className="flow-primary-button" onClick={runCurrentFlow}>
-                {isFlowLoading ? "处理中..." : "运行调试"}
+                {isRunStreaming ? "运行中..." : "运行调试"}
               </button>
             </div>
           </header>
@@ -1165,56 +1270,55 @@ function FlowStudioContent() {
             </section>
 
             <aside className="flow-editor-panel">
-              <strong>节点配置</strong>
-              {selectedNode ? (
-                <>
-                  <label className="flow-field flow-field-compact">
-                    <span>节点标题</span>
-                    <input
-                      value={selectedNode.data.label}
-                      onChange={(event) => updateSelectedNode({ label: event.target.value })}
-                    />
-                  </label>
-                  {selectedNode.data.kind === "agent" ? (
-                    <FormProvider form={agentForm}>
-                      <div className="agent-config-form">
+              <div className="config-panel-head">
+                <strong>{selectedNode?.data.kind === "agent" ? "Agent 参数" : "节点配置"}</strong>
+                {selectedNode ? <span>{selectedNode.data.kind} · {selectedNode.id}</span> : null}
+              </div>
+              <div className="config-panel-body">
+                {selectedNode ? (
+                  <>
+                    <div className="config-panel-scroll">
+                      <div className="node-compact-row">
                         <label className="flow-field flow-field-compact">
-                          <span>绑定 Agent</span>
-                          <select
-                            value={selectedNode.data.agentId ?? selectedNode.data.agentName ?? agentOptions[0]?.id ?? ""}
-                            disabled={agentOptions.length === 0}
-                            onChange={(event) =>
-                              {
-                                const agent = agentOptions.find((item) => item.id === event.target.value);
-                                updateSelectedNode({
-                                  agentId: event.target.value,
-                                  agentName: agent?.name ?? event.target.value,
-                                  label: agent?.name ?? event.target.value,
-                                });
-                              }
-                            }
-                          >
-                            {agentOptions.length === 0 ? <option value="">暂无后端 Agent</option> : null}
-                            {agentOptions.map((agent) => (
-                              <option key={agent.id} value={agent.id}>
-                                {agent.name}
-                              </option>
-                            ))}
-                          </select>
+                          <span>节点标题</span>
+                          <input
+                            value={selectedNode.data.label}
+                            onChange={(event) => updateSelectedNode({ label: event.target.value })}
+                          />
                         </label>
-                        <label className="flow-field flow-field-compact">
-                          <span>Agent 名称</span>
-                          <Field name="name" component={[TextControl]} />
-                        </label>
-                        <label className="flow-field flow-field-compact">
-                          <span>描述</span>
-                          <Field name="description" component={[TextControl, { multiline: true, rows: 2 }]} />
-                        </label>
-                        <label className="flow-field flow-field-compact">
-                          <span>详细指令</span>
-                          <Field name="instructions" component={[TextControl, { multiline: true, rows: 5 }]} />
-                        </label>
-                        <div className="agent-config-grid">
+                      </div>
+                      {selectedNode.data.kind === "agent" ? (
+                        <FormProvider form={agentForm}>
+                          <div className="agent-config-form">
+                            <label className="flow-field flow-field-compact">
+                              <span>绑定 Agent</span>
+                              <select
+                                value={selectedNode.data.agentId ?? selectedNode.data.agentName ?? agentOptions[0]?.id ?? ""}
+                                disabled={agentOptions.length === 0}
+                                onChange={(event) =>
+                                  {
+                                    const agent = agentOptions.find((item) => item.id === event.target.value);
+                                    updateSelectedNode({
+                                      agentId: event.target.value,
+                                      agentName: agent?.name ?? event.target.value,
+                                      label: agent?.name ?? event.target.value,
+                                    });
+                                  }
+                                }
+                              >
+                                {agentOptions.length === 0 ? <option value="">暂无后端 Agent</option> : null}
+                                {agentOptions.map((agent) => (
+                                  <option key={agent.id} value={agent.id}>
+                                    {agent.name}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                            <div className="agent-config-grid">
+                          <label className="flow-field flow-field-compact">
+                            <span>Agent 名称</span>
+                            <Field name="name" component={[TextControl]} />
+                          </label>
                           <label className="flow-field flow-field-compact">
                             <span>模型</span>
                             <Field name="model" component={[TextControl, { placeholder: "gpt-4.1-mini" }]} />
@@ -1224,6 +1328,14 @@ function FlowStudioContent() {
                             <Field name="temperature" component={[TextControl, { placeholder: "0.2" }]} />
                           </label>
                         </div>
+                        <label className="flow-field flow-field-compact">
+                          <span>详细指令</span>
+                          <Field name="instructions" component={[TextControl, { multiline: true, rows: 2 }]} />
+                        </label>
+                        <label className="flow-field flow-field-compact">
+                          <span>描述</span>
+                          <Field name="description" component={[TextControl, { multiline: true, rows: 1 }]} />
+                        </label>
                         <div className="agent-config-grid">
                           <label className="flow-field flow-field-compact">
                             <span>技能 IDs</span>
@@ -1242,22 +1354,81 @@ function FlowStudioContent() {
                           <Field name="stream" component={[ToggleControl, { label: "流式输出" }]} />
                           <Field name="debug" component={[ToggleControl, { label: "调试" }]} />
                         </div>
-                        <button type="button" className="flow-primary-button agent-save-button" onClick={saveSelectedAgent}>
-                          {isAgentSaving ? "保存中..." : "保存 Agent"}
-                        </button>
+                            <button type="button" className="flow-primary-button agent-save-button" onClick={saveSelectedAgent}>
+                              {isAgentSaving ? "保存中..." : "保存 Agent"}
+                            </button>
+                          </div>
+                        </FormProvider>
+                      ) : null}
+                      {selectedNode.data.kind === "agent" || selectedNode.data.kind === "team" ? (
+                        <div className="retry-config-card">
+                      <div className="config-section-title">
+                        <strong>失败回流</strong>
+                        <span>失败时回跳</span>
                       </div>
-                    </FormProvider>
-                  ) : null}
-                  {selectedNode.data.kind === "team" ? (
-                    <div className="team-config-card">
+                      <div className="agent-config-grid">
+                        <label className="flow-field flow-field-compact">
+                          <span>最大重试</span>
+                          <input
+                            type="number"
+                            min={0}
+                            value={selectedNode.data.maxRetry ?? 0}
+                            onChange={(event) => updateSelectedNode({ maxRetry: Number(event.target.value) })}
+                          />
+                        </label>
+                        <label className="flow-field flow-field-compact">
+                          <span>失败跳转</span>
+                          <select
+                            value={selectedNode.data.onFail ?? ""}
+                            onChange={(event) => {
+                              const targetId = event.target.value;
+                              updateSelectedNode({ onFail: targetId });
+                              setEdges((current) => {
+                                const withoutOldFailure = current.filter(
+                                  (edge) => !(edge.source === selectedNode.id && edge.data?.branch === "failure"),
+                                );
+
+                                if (!targetId) {
+                                  return withoutOldFailure;
+                                }
+
+                                return addEdge(
+                                  {
+                                    id: `edge_${selectedNode.id}_${targetId}_failure`,
+                                    source: selectedNode.id,
+                                    target: targetId,
+                                    animated: true,
+                                    className: "flow-edge-failure",
+                                    data: { branch: "failure" },
+                                  },
+                                  withoutOldFailure,
+                                );
+                              });
+                            }}
+                          >
+                            <option value="">不回流</option>
+                            {nodes
+                              .filter((node) => node.id !== selectedNode.id)
+                              .map((node) => (
+                                <option key={node.id} value={node.id}>
+                                  {node.data.label}
+                                </option>
+                              ))}
+                          </select>
+                        </label>
+                      </div>
+                        </div>
+                      ) : null}
+                      {selectedNode.data.kind === "team" ? (
+                        <div className="team-config-card">
                       <div>
                         <strong>Team 子编排</strong>
-                        <p>用于把多个已有 Agent 组合成一个可嵌套节点。上游拆出 todo list 时，也可以从同一上游添加多个同级 Team/Agent 节点并列处理。</p>
+                        <p>嵌套已有 Agent，支持并行/串行。</p>
                       </div>
                       <label className="flow-field flow-field-compact">
                         <span>Team 描述</span>
                         <textarea
-                          rows={3}
+                          rows={2}
                           value={selectedNode.data.teamDescription ?? ""}
                           onChange={(event) => updateSelectedNode({ teamDescription: event.target.value })}
                         />
@@ -1282,29 +1453,20 @@ function FlowStudioContent() {
                           placeholder="agent_a, agent_b"
                         />
                       </label>
+                        </div>
+                      ) : null}
                     </div>
-                  ) : null}
-                  <span>类型：{selectedNode.data.kind}</span>
-                  <span>节点 ID：{selectedNode.id}</span>
-                  {runResult ? (
-                    <div className="flow-run-result">
-                      <strong>Run 结果：{runResult.status}</strong>
-                      <span>Run ID：{runResult.id}</span>
-                      <pre>{JSON.stringify(runResult.output, null, 2)}</pre>
-                      <div className="flow-run-steps">
-                        {runResult.steps.map((step) => (
-                          <div key={step.id} className={`flow-run-step flow-run-step-${step.status}`}>
-                            <span>{step.node_id}</span>
-                            <span>{step.status}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-                </>
-              ) : (
-                <span>先点击画布中的节点，再在这里编辑配置。</span>
-              )}
+                    <RunConsole
+                      title="Run Console"
+                      isRunning={isRunStreaming}
+                      events={runEvents}
+                      result={runResult}
+                    />
+                  </>
+                ) : (
+                  <span>先点击画布中的节点，再在这里编辑配置。</span>
+                )}
+              </div>
             </aside>
           </div>
 
