@@ -5,6 +5,7 @@ import "@xyflow/react/dist/style.css";
 import {
   addEdge,
   Background,
+  ControlButton,
   Controls,
   Handle,
   Position,
@@ -22,7 +23,7 @@ import {
 } from "@xyflow/react";
 import { createForm } from "@formily/core";
 import { Field, FormProvider } from "@formily/react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent } from "react";
 import {
   flowStudioNodeConfigs,
   getFlowStudioNodeConfig,
@@ -167,6 +168,19 @@ type StudioNodeData = {
   memberAgentIds?: string[];
   maxRetry?: number;
   onFail?: string;
+  // Condition node fields
+  conditionType?: "expression" | "llm_classify" | "regex" | "json_schema" | "simple";
+  inputSource?: string;
+  expression?: string;
+  llmConfig?: {
+    model: string;
+    prompt: string;
+    categories: string[];
+  };
+  regexPatterns?: { pattern: string; branchId: string }[];
+  jsonSchema?: object;
+  branches?: { id: string; label: string; conditionValue?: string; targetNodeId?: string }[];
+  defaultBranchId?: string;
 };
 
 type StudioFlowNode = Node<StudioNodeData>;
@@ -541,69 +555,80 @@ function StudioNodeCard(props: NodeProps<StudioFlowNode> & {
     event.stopPropagation();
     const rect = event.currentTarget.getBoundingClientRect();
     onAddNodeClick(id, {
-      x: rect.right,
-      y: rect.top + rect.height / 2,
+      x: rect.left + rect.width / 2,
+      y: rect.bottom + 8,
     });
   };
 
+  const hint =
+    data.kind === "start"
+      ? "添加后续节点"
+      : data.kind === "condition"
+        ? "配置条件"
+        : data.kind === "end"
+          ? "结束节点"
+          : "配置节点";
+
   return (
-    <div className={`studio-node-card studio-node-${data.kind} ${selected ? "is-selected" : ""}`}>
-      {canDelete ? (
-        <button
-          type="button"
-          className="studio-node-delete-button"
-          onMouseDown={(event) => event.stopPropagation()}
-          onClick={(event) => {
-            event.stopPropagation();
-            onDeleteNodeClick(id);
-          }}
-          aria-label="删除节点"
-        >
-          ×
-        </button>
-      ) : null}
+    <>
+      <div className={`studio-node-card studio-node-${data.kind} ${selected ? "is-selected" : ""}`}>
+        {canConnectIn ? (
+          <Handle
+            type="target"
+            position={Position.Left}
+            className="studio-node-handle studio-node-handle-left"
+          />
+        ) : null}
 
-      {canConnectIn ? (
-        <Handle
-          type="target"
-          position={Position.Left}
-          className="studio-node-handle studio-node-handle-left"
-        />
-      ) : null}
+        <div className="studio-node-head">
+          <div className="studio-node-icon" aria-hidden="true">
+            {data.kind.slice(0, 1).toUpperCase()}
+          </div>
+          <div className="studio-node-copy">
+            <strong>{data.label}</strong>
+            <span>{config.label}</span>
+          </div>
+        </div>
 
-      <div className="studio-node-icon" style={{ background: config.color }}>
-        {data.kind.slice(0, 1).toUpperCase()}
-      </div>
-      <div className="studio-node-copy">
-        <strong>{data.label}</strong>
-        <span>{config.label}</span>
-      </div>
+        <div className="studio-node-body">{hint}</div>
 
-      {canAddNext ? (
-        <>
+        <div className="studio-node-actions" onMouseDown={(event) => event.stopPropagation()}>
+          {canAddNext ? (
+            <button
+              type="button"
+              className="studio-node-action-button"
+              onClick={openNodeSelector}
+              aria-label="添加节点"
+              title="添加节点"
+            >
+              +
+            </button>
+          ) : null}
+          {canDelete ? (
+            <button
+              type="button"
+              className="studio-node-action-button is-danger"
+              onClick={(event) => {
+                event.stopPropagation();
+                onDeleteNodeClick(id);
+              }}
+              aria-label="删除节点"
+              title="删除节点"
+            >
+              ×
+            </button>
+          ) : null}
+        </div>
+
+        {canAddNext ? (
           <Handle
             type="source"
             position={Position.Right}
             className="studio-node-handle studio-node-handle-right"
           />
-          <div className="studio-node-add-zone">
-            <button
-              type="button"
-              className="studio-node-add-button"
-              onMouseDown={(event) => event.stopPropagation()}
-              onClick={openNodeSelector}
-              aria-label="添加下一个节点"
-            >
-              +
-            </button>
-            <div className="studio-node-add-tip">
-              <strong>点击</strong>添加节点
-              <span>拖拽连接节点</span>
-            </div>
-          </div>
-        </>
-      ) : null}
-    </div>
+        ) : null}
+      </div>
+    </>
   );
 }
 
@@ -692,8 +717,16 @@ function FlowCanvas(props: {
   onAddNodeClick: (nodeId: string, screenPosition: { x: number; y: number }) => void;
   onDeleteNodeClick: (nodeId: string) => void;
   focusNodeId?: string | null;
+  centerSignal?: number;
 }) {
   const { fitView } = useReactFlow();
+  const centerCanvas = useCallback(() => {
+    fitView({
+      duration: 300,
+      padding: 0.28,
+      maxZoom: 0.95,
+    });
+  }, [fitView]);
   const nodeTypes = useMemo(
     () => ({
       studio: (nodeProps: NodeProps<StudioFlowNode>) => (
@@ -727,7 +760,16 @@ function FlowCanvas(props: {
     }, 30);
 
     return () => window.clearTimeout(timer);
-  }, [fitView, props.focusNodeId, props.nodes]);
+  }, [fitView, props.focusNodeId]);
+
+  useEffect(() => {
+    if (!props.centerSignal) {
+      return;
+    }
+
+    const timer = window.setTimeout(centerCanvas, 120);
+    return () => window.clearTimeout(timer);
+  }, [centerCanvas, props.centerSignal]);
 
   return (
     <ReactFlow<StudioFlowNode, Edge>
@@ -745,7 +787,11 @@ function FlowCanvas(props: {
       onPaneClick={props.onPaneClick}
     >
       <Background gap={20} size={1} />
-      <Controls />
+      <Controls>
+        <ControlButton onClick={centerCanvas} title="回到中央" aria-label="回到中央">
+          ⌖
+        </ControlButton>
+      </Controls>
     </ReactFlow>
   );
 }
@@ -803,6 +849,7 @@ function FlowStudioContent() {
   const [backendAgents, setBackendAgents] = useState<BackendAgent[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [focusNodeId, setFocusNodeId] = useState<string | null>(null);
+  const [centerSignal, setCenterSignal] = useState(0);
   const [canvasNotice, setCanvasNotice] = useState<string>("");
   const [flowError, setFlowError] = useState<string>("");
   const [isFlowLoading, setIsFlowLoading] = useState(false);
@@ -819,6 +866,13 @@ function FlowStudioContent() {
   const agentOptions = backendAgents;
   const [nodes, setNodes, onNodesChange] = useNodesState<StudioFlowNode>(selectedFlow ? createNodesFromDefinition(selectedFlow.definition) : []);
   const [edges, setEdges, onEdgesChange] = useEdgesState(selectedFlow ? createEdgesFromDefinition(selectedFlow.definition) : []);
+
+  useEffect(() => {
+    const centerOnNormalWindow = () => setCenterSignal((value) => value + 1);
+
+    window.addEventListener("agent-studio:center-flow", centerOnNormalWindow);
+    return () => window.removeEventListener("agent-studio:center-flow", centerOnNormalWindow);
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -1046,7 +1100,7 @@ function FlowStudioContent() {
 
     setNodes((current) => current.filter((node) => node.id !== nodeId));
     setEdges((current) => current.filter((edge) => edge.source !== nodeId && edge.target !== nodeId));
-    setCanvasNotice("已删除节点");
+    setCanvasNotice("已删除节点，请手动重新连接上下游");
 
     if (selectedNodeId === nodeId) {
       setSelectedNodeId(null);
@@ -1242,7 +1296,7 @@ function FlowStudioContent() {
 
           {flowError ? <div className="flow-inline-alert">{flowError}</div> : null}
 
-          <div className="flow-editor-shell">
+          <div className={`flow-editor-shell ${selectedNodeId ? 'has-panel-open' : ''}`}>
             <section className="flow-editor-canvas">
               {canvasNotice ? <div className="flow-canvas-notice">{canvasNotice}</div> : null}
               <ReactFlowProvider>
@@ -1260,6 +1314,7 @@ function FlowStudioContent() {
                   onAddNodeClick={openNodeSelectorFromNode}
                   onDeleteNodeClick={deleteNodeById}
                   focusNodeId={focusNodeId}
+                  centerSignal={centerSignal}
                 />
               </ReactFlowProvider>
               <FlowNodeSelector
@@ -1269,10 +1324,20 @@ function FlowStudioContent() {
               />
             </section>
 
-            <aside className="flow-editor-panel">
+            <aside className={`flow-editor-panel ${selectedNodeId ? 'is-open' : ''}`}>
               <div className="config-panel-head">
-                <strong>{selectedNode?.data.kind === "agent" ? "Agent 参数" : "节点配置"}</strong>
-                {selectedNode ? <span>{selectedNode.data.kind} · {selectedNode.id}</span> : null}
+                <div className="config-panel-title">
+                  <strong>{selectedNode?.data.kind === "agent" ? "Agent 参数" : "节点配置"}</strong>
+                  {selectedNode ? <span>{selectedNode.data.kind} · {selectedNode.id}</span> : null}
+                </div>
+                <button
+                  type="button"
+                  className="panel-close-button"
+                  onClick={() => setSelectedNodeId(null)}
+                  aria-label="关闭面板"
+                >
+                  ×
+                </button>
               </div>
               <div className="config-panel-body">
                 {selectedNode ? (
@@ -1314,46 +1379,60 @@ function FlowStudioContent() {
                                 ))}
                               </select>
                             </label>
+
                             <div className="agent-config-grid">
-                          <label className="flow-field flow-field-compact">
-                            <span>Agent 名称</span>
-                            <Field name="name" component={[TextControl]} />
-                          </label>
-                          <label className="flow-field flow-field-compact">
-                            <span>模型</span>
-                            <Field name="model" component={[TextControl, { placeholder: "gpt-4.1-mini" }]} />
-                          </label>
-                          <label className="flow-field flow-field-compact">
-                            <span>温度</span>
-                            <Field name="temperature" component={[TextControl, { placeholder: "0.2" }]} />
-                          </label>
-                        </div>
-                        <label className="flow-field flow-field-compact">
-                          <span>详细指令</span>
-                          <Field name="instructions" component={[TextControl, { multiline: true, rows: 2 }]} />
-                        </label>
-                        <label className="flow-field flow-field-compact">
-                          <span>描述</span>
-                          <Field name="description" component={[TextControl, { multiline: true, rows: 1 }]} />
-                        </label>
-                        <div className="agent-config-grid">
-                          <label className="flow-field flow-field-compact">
-                            <span>技能 IDs</span>
-                            <Field name="skillIds" component={[TextControl, { placeholder: "skill_triage" }]} />
-                          </label>
-                          <label className="flow-field flow-field-compact">
-                            <span>知识库 IDs</span>
-                            <Field name="knowledgeIds" component={[TextControl, { placeholder: "kb_support" }]} />
-                          </label>
-                        </div>
-                        <label className="flow-field flow-field-compact">
-                          <span>工具 IDs</span>
-                          <Field name="toolIds" component={[TextControl, { placeholder: "tool_search, tool_http" }]} />
-                        </label>
-                        <div className="agent-config-toggles">
-                          <Field name="stream" component={[ToggleControl, { label: "流式输出" }]} />
-                          <Field name="debug" component={[ToggleControl, { label: "调试" }]} />
-                        </div>
+                              <label className="flow-field flow-field-compact">
+                                <span>Agent 名称</span>
+                                <Field name="name" component={[TextControl]} />
+                              </label>
+                              <label className="flow-field flow-field-compact">
+                                <span>模型</span>
+                                <Field name="model" component={[TextControl, { placeholder: "gpt-4.1-mini" }]} />
+                              </label>
+                            </div>
+
+                            <div className="agent-config-grid">
+                              <label className="flow-field flow-field-compact">
+                                <span>温度</span>
+                                <Field name="temperature" component={[TextControl, { placeholder: "0.2" }]} />
+                              </label>
+                              <label className="flow-field flow-field-compact">
+                                <span>最大重试次数</span>
+                                <Field name="maxRetry" component={[TextControl, { placeholder: "0" }]} />
+                              </label>
+                            </div>
+
+                            <label className="flow-field flow-field-compact">
+                              <span>详细指令</span>
+                              <Field name="instructions" component={[TextControl, { multiline: true, rows: 3 }]} />
+                            </label>
+
+                            <label className="flow-field flow-field-compact">
+                              <span>描述</span>
+                              <Field name="description" component={[TextControl, { multiline: true, rows: 2 }]} />
+                            </label>
+
+                            <div className="agent-config-grid">
+                              <label className="flow-field flow-field-compact">
+                                <span>技能 IDs</span>
+                                <Field name="skillIds" component={[TextControl, { placeholder: "skill_triage" }]} />
+                              </label>
+                              <label className="flow-field flow-field-compact">
+                                <span>知识库 IDs</span>
+                                <Field name="knowledgeIds" component={[TextControl, { placeholder: "kb_support" }]} />
+                              </label>
+                            </div>
+
+                            <label className="flow-field flow-field-compact">
+                              <span>工具 IDs</span>
+                              <Field name="toolIds" component={[TextControl, { placeholder: "tool_search, tool_http" }]} />
+                            </label>
+
+                            <div className="agent-config-toggles">
+                              <Field name="stream" component={[ToggleControl, { label: "流式输出" }]} />
+                              <Field name="debug" component={[ToggleControl, { label: "调试" }]} />
+                            </div>
+
                             <button type="button" className="flow-primary-button agent-save-button" onClick={saveSelectedAgent}>
                               {isAgentSaving ? "保存中..." : "保存 Agent"}
                             </button>
@@ -1362,41 +1441,41 @@ function FlowStudioContent() {
                       ) : null}
                       {selectedNode.data.kind === "agent" || selectedNode.data.kind === "team" ? (
                         <div className="retry-config-card">
-                      <div className="config-section-title">
-                        <strong>失败回流</strong>
-                        <span>失败时回跳</span>
-                      </div>
-                      <div className="agent-config-grid">
-                        <label className="flow-field flow-field-compact">
-                          <span>最大重试</span>
-                          <input
-                            type="number"
-                            min={0}
-                            value={selectedNode.data.maxRetry ?? 0}
-                            onChange={(event) => updateSelectedNode({ maxRetry: Number(event.target.value) })}
-                          />
-                        </label>
-                        <label className="flow-field flow-field-compact">
-                          <span>失败跳转</span>
-                          <select
-                            value={selectedNode.data.onFail ?? ""}
-                            onChange={(event) => {
-                              const targetId = event.target.value;
-                              updateSelectedNode({ onFail: targetId });
-                              setEdges((current) => {
-                                const withoutOldFailure = current.filter(
-                                  (edge) => !(edge.source === selectedNode.id && edge.data?.branch === "failure"),
-                                );
+                          <div className="config-section-title">
+                            <strong>失败回流</strong>
+                            <span>失败时回跳</span>
+                          </div>
+                          <div className="agent-config-grid">
+                            <label className="flow-field flow-field-compact">
+                              <span>最大重试</span>
+                              <input
+                                type="number"
+                                min={0}
+                                value={selectedNode.data.maxRetry ?? 0}
+                                onChange={(event) => updateSelectedNode({ maxRetry: Number(event.target.value) })}
+                              />
+                            </label>
+                            <label className="flow-field flow-field-compact">
+                              <span>失败跳转</span>
+                              <select
+                                value={selectedNode.data.onFail ?? ""}
+                                onChange={(event) => {
+                                  const targetId = event.target.value;
+                                  updateSelectedNode({ onFail: targetId });
+                                  setEdges((current) => {
+                                    const withoutOldFailure = current.filter(
+                                      (edge) => !(edge.source === selectedNode.id && edge.data?.branch === "failure"),
+                                    );
 
-                                if (!targetId) {
-                                  return withoutOldFailure;
-                                }
+                                    if (!targetId) {
+                                      return withoutOldFailure;
+                                    }
 
-                                return addEdge(
-                                  {
-                                    id: `edge_${selectedNode.id}_${targetId}_failure`,
-                                    source: selectedNode.id,
-                                    target: targetId,
+                                    return addEdge(
+                                      {
+                                        id: `edge_${selectedNode.id}_${targetId}_failure`,
+                                        source: selectedNode.id,
+                                        target: targetId,
                                     animated: true,
                                     className: "flow-edge-failure",
                                     data: { branch: "failure" },
@@ -1453,6 +1532,136 @@ function FlowStudioContent() {
                           placeholder="agent_a, agent_b"
                         />
                       </label>
+                        </div>
+                      ) : null}
+
+                      {selectedNode.data.kind === "condition" ? (
+                        <div className="condition-config-card">
+                          <div className="config-section-title">
+                            <strong>条件分支配置</strong>
+                            <span>根据条件路由到不同分支</span>
+                          </div>
+
+                          <label className="flow-field flow-field-compact">
+                            <span>条件类型</span>
+                            <select
+                              value={selectedNode.data.conditionType ?? "expression"}
+                              onChange={(event) =>
+                                updateSelectedNode({
+                                  conditionType: event.target.value as StudioNodeData["conditionType"],
+                                  branches: [{ id: "branch_1", label: "分支 1", conditionValue: "" }, { id: "branch_2", label: "分支 2", conditionValue: "" }],
+                                  defaultBranchId: "branch_2",
+                                })
+                              }
+                            >
+                              <option value="expression">表达式</option>
+                              <option value="llm_classify">LLM 分类</option>
+                              <option value="regex">正则匹配</option>
+                              <option value="json_schema">JSON Schema</option>
+                            </select>
+                          </label>
+
+                          <label className="flow-field flow-field-compact">
+                            <span>输入来源</span>
+                            <input
+                              value={selectedNode.data.inputSource ?? "{{input.user_message}}"}
+                              onChange={(event) => updateSelectedNode({ inputSource: event.target.value })}
+                              placeholder="{{input.user_message}}"
+                            />
+                          </label>
+
+                          {selectedNode.data.conditionType === "expression" && (
+                            <label className="flow-field flow-field-compact">
+                              <span>表达式</span>
+                              <input
+                                value={selectedNode.data.expression ?? ""}
+                                onChange={(event) => updateSelectedNode({ expression: event.target.value })}
+                                placeholder="{{input.priority}} === 'high'"
+                              />
+                            </label>
+                          )}
+
+                          {selectedNode.data.conditionType === "llm_classify" && (
+                            <>
+                              <label className="flow-field flow-field-compact">
+                                <span>模型</span>
+                                <input
+                                  value={selectedNode.data.llmConfig?.model ?? "gpt-4.1-mini"}
+                                  onChange={(event) =>
+                                    updateSelectedNode({
+                                      llmConfig: { ...selectedNode.data.llmConfig, model: event.target.value } as StudioNodeData["llmConfig"],
+                                    })
+                                  }
+                                  placeholder="gpt-4.1-mini"
+                                />
+                              </label>
+                              <label className="flow-field flow-field-compact">
+                                <span>分类提示词</span>
+                                <textarea
+                                  rows={2}
+                                  value={selectedNode.data.llmConfig?.prompt ?? ""}
+                                  onChange={(event) =>
+                                    updateSelectedNode({
+                                      llmConfig: { ...selectedNode.data.llmConfig, prompt: event.target.value } as StudioNodeData["llmConfig"],
+                                    })
+                                  }
+                                  placeholder="判断用户意图属于以下哪类..."
+                                />
+                              </label>
+                            </>
+                          )}
+
+                          <div className="config-section-title" style={{ marginTop: "12px" }}>
+                            <strong>分支定义</strong>
+                          </div>
+
+                          {(selectedNode.data.branches ?? []).map((branch, index) => (
+                            <div key={branch.id} className="node-compact-row">
+                              <label className="flow-field flow-field-compact">
+                                <span>分支 {index + 1} 名称</span>
+                                <input
+                                  value={branch.label}
+                                  onChange={(event) => {
+                                    const newBranches = [...(selectedNode.data.branches ?? [])];
+                                    newBranches[index] = { ...branch, label: event.target.value };
+                                    updateSelectedNode({ branches: newBranches });
+                                  }}
+                                />
+                              </label>
+                              {selectedNode.data.conditionType !== "expression" && (
+                                <label className="flow-field flow-field-compact">
+                                  <span>匹配值</span>
+                                  <input
+                                    value={branch.conditionValue ?? ""}
+                                    onChange={(event) => {
+                                      const newBranches = [...(selectedNode.data.branches ?? [])];
+                                      newBranches[index] = { ...branch, conditionValue: event.target.value };
+                                      updateSelectedNode({ branches: newBranches });
+                                    }}
+                                    placeholder={selectedNode.data.conditionType === "regex" ? "正则表达式" : "匹配值"}
+                                  />
+                                </label>
+                              )}
+                            </div>
+                          ))}
+
+                          <button
+                            type="button"
+                            className="flow-secondary-button"
+                            style={{ marginTop: "8px", width: "100%" }}
+                            onClick={() => {
+                              const newBranch = {
+                                id: `branch_${Date.now()}`,
+                                label: `分支 ${(selectedNode.data.branches ?? []).length + 1}`,
+                                conditionValue: "",
+                              };
+                              updateSelectedNode({
+                                branches: [...(selectedNode.data.branches ?? []), newBranch],
+                              });
+                            }}
+                          >
+                            + 添加分支
+                          </button>
                         </div>
                       ) : null}
                     </div>
@@ -1688,6 +1897,8 @@ export default function HomePage() {
   });
   const [isDockCollapsed, setIsDockCollapsed] = useState(false);
   const [isWindowClosed, setIsWindowClosed] = useState(false);
+  const [windowPosition, setWindowPosition] = useState<{ x: number; y: number } | null>(null);
+  const [isWindowDragging, setIsWindowDragging] = useState(false);
 
   const activeApp = useMemo(
     () => apps.find((app) => app.id === activeAppId) ?? apps[0],
@@ -1711,7 +1922,11 @@ export default function HomePage() {
 
       setActiveAppId(nextAppId);
       setWindowMode(
-        routeMode === "minimized" ? "minimized" : nextAppId === "home" ? "normal" : "maximized",
+        routeMode === "minimized" || routeMode === "normal"
+          ? routeMode
+          : nextAppId === "home"
+            ? "normal"
+            : "maximized",
       );
       setIsWindowClosed(false);
     };
@@ -1723,7 +1938,54 @@ export default function HomePage() {
   const openApp = (id: AppId) => {
     setActiveAppId(id);
     setIsWindowClosed(false);
-    setWindowMode(id === "home" ? "normal" : "maximized");
+    setWindowMode((mode) => (id === "home" || mode === "minimized" ? "normal" : mode));
+  };
+
+  const startWindowDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (windowMode === "maximized" || event.button !== 0) {
+      return;
+    }
+
+    if (event.target instanceof Element && event.target.closest(".window-actions")) {
+      return;
+    }
+
+    const windowElement = event.currentTarget.closest(".app-window");
+    if (!(windowElement instanceof HTMLElement)) {
+      return;
+    }
+
+    const rect = windowElement.getBoundingClientRect();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const originX = rect.left;
+    const originY = rect.top;
+
+    setWindowPosition({ x: originX, y: originY });
+    setIsWindowDragging(true);
+
+    const moveWindow = (moveEvent: PointerEvent) => {
+      const nextX = originX + moveEvent.clientX - startX;
+      const nextY = originY + moveEvent.clientY - startY;
+      const maxX = Math.max(12, window.innerWidth - rect.width - 12);
+      const maxY = Math.max(52, window.innerHeight - rect.height - 12);
+
+      setWindowPosition({
+        x: Math.min(Math.max(12, nextX), maxX),
+        y: Math.min(Math.max(52, nextY), maxY),
+      });
+    };
+
+    const stopWindowDrag = () => {
+      setIsWindowDragging(false);
+      window.removeEventListener("pointermove", moveWindow);
+      window.removeEventListener("pointerup", stopWindowDrag);
+      window.removeEventListener("pointercancel", stopWindowDrag);
+    };
+
+    window.addEventListener("pointermove", moveWindow);
+    window.addEventListener("pointerup", stopWindowDrag);
+    window.addEventListener("pointercancel", stopWindowDrag);
   };
 
   const closeWindow = () => {
@@ -1735,6 +1997,18 @@ export default function HomePage() {
 
   const showWindow = !isWindowClosed && windowMode !== "minimized";
   const isFullscreen = windowMode === "maximized";
+
+  useEffect(() => {
+    if (activeAppId !== "flow" || windowMode !== "normal" || !showWindow) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      window.dispatchEvent(new Event("agent-studio:center-flow"));
+    }, 160);
+
+    return () => window.clearTimeout(timer);
+  }, [activeAppId, showWindow, windowMode]);
 
   return (
     <main className={`desktop-scene ${isFullscreen ? "is-window-maximized" : ""}`}>
@@ -1787,8 +2061,17 @@ export default function HomePage() {
       </section>
 
       {showWindow ? (
-        <section className={`app-window ${windowMode === "maximized" ? "is-maximized" : ""}`}>
-          <div className="window-titlebar">
+        <section
+          className={`app-window ${windowMode === "maximized" ? "is-maximized" : ""} ${
+            isWindowDragging ? "is-dragging" : ""
+          }`}
+          style={
+            windowMode === "normal" && windowPosition
+              ? { left: windowPosition.x, top: windowPosition.y, transform: "none" }
+              : undefined
+          }
+        >
+          <div className="window-titlebar" onPointerDown={startWindowDrag}>
             <div className="window-app">
               <div className="window-app-icon" style={{ background: activeApp.color }}>
                 <AppGlyph icon={activeApp.icon} />
