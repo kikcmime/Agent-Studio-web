@@ -9,6 +9,7 @@
     "jsx": "preserve",
     "baseUrl": ".",
     "paths": {
+      "@agent-studio/shared": ["packages/shared/src/index.ts"],
       "@agent-studio/shared/*": ["packages/shared/src/*"]
     }
   }

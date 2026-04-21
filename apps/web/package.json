@@ -3,6 +3,8 @@
   "private": true,
   "version": "0.1.0",
   "dependencies": {
+    "@formily/core": "^2.3.4",
+    "@formily/react": "^2.3.4",
     "@xyflow/react": "^12.10.2",
     "next": "^15.0.0",
     "react": "^19.0.0",

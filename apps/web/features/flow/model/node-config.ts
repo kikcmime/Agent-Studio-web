@@ -1,4 +1,4 @@
-export type FlowStudioNodeKind = "start" | "agent" | "condition" | "end";
+export type FlowStudioNodeKind = "start" | "agent" | "team" | "condition" | "end";
 
 export type FlowStudioNodeConfig = {
   kind: FlowStudioNodeKind;
@@ -19,6 +19,12 @@ export const flowStudioNodeConfigs: FlowStudioNodeConfig[] = [
     label: "Agent",
     description: "绑定已有 Agent，执行模型、技能和知识库能力。",
     color: "rgba(224, 232, 255, 0.95)",
+  },
+  {
+    kind: "team",
+    label: "Team",
+    description: "组合多个已有 Agent，表达一个可嵌套的子团队或子编排。",
+    color: "rgba(219, 246, 255, 0.95)",
   },
   {
     kind: "condition",
