@@ -23,7 +23,7 @@ import {
 } from "@xyflow/react";
 import { createForm } from "@formily/core";
 import { Field, FormProvider } from "@formily/react";
-import { useCallback, useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import {
   flowStudioNodeConfigs,
   getFlowStudioNodeConfig,
@@ -33,18 +33,23 @@ import {
   createBackendFlow,
   getBackendAgent,
   getBackendFlow,
+  getBackendTeam,
   listBackendAgents,
   listBackendFlows,
+  listBackendTeams,
   runBackendFlow,
   streamBackendFlowRun,
   updateBackendAgent,
+  updateBackendFlow,
   type BackendAgent,
   type BackendAgentDetail,
   type BackendFlow,
   type BackendFlowDefinition,
   type BackendFlowNode,
+  type BackendFlowSummary,
   type BackendRunDetail,
   type BackendRunStreamEvent,
+  type BackendTeam,
 } from "../features/flow/model/flow-api";
 
 type AppId = "home" | "flow" | "agents" | "skills" | "knowledge" | "mcp";
@@ -110,15 +115,6 @@ const apps: DesktopApp[] = [
   },
 ];
 
-const homeHighlights = [
-  "Flow 编排",
-  "Agent 配置",
-  "Skill 绑定",
-  "知识库接入",
-  "MCP 能力接入",
-  "Run 运行观测",
-];
-
 const isAppId = (value: string | null): value is AppId =>
   Boolean(value && apps.some((app) => app.id === value));
 
@@ -151,9 +147,12 @@ const replaceRouteQuery = (patch: Record<string, string | null>) => {
 type FlowRecord = {
   id: string;
   name: string;
+  flowType: "agent" | "team";
   status: "draft" | "published";
+  latestVersion: number;
   updatedAt: string;
-  agents: string[];
+  resources: string[];
+  types: string[];
   description: string;
   definition: BackendFlowDefinition;
 };
@@ -163,6 +162,8 @@ type StudioNodeData = {
   label: string;
   agentName?: string;
   agentId?: string;
+  teamId?: string;
+  teamName?: string;
   teamDescription?: string;
   teamStrategy?: "parallel" | "sequential";
   memberAgentIds?: string[];
@@ -327,16 +328,21 @@ const getNodeStyle = (kind: FlowStudioNodeKind) => ({
 });
 
 const backendFlowToRecord = (flow: BackendFlow): FlowRecord => {
-  const agents = flow.definition.nodes
-    .filter((node): node is Extract<BackendFlowNode, { type: "agent" }> => node.type === "agent")
+  const resources = flow.definition.nodes
+    .filter((node): node is Extract<BackendFlowNode, { type: "agent" | "team" }> => node.type === "agent" || node.type === "team")
     .map((node) => node.data.label);
+  const types = Array.from(new Set(flow.definition.nodes.map((node) => node.type)));
+  const inferredFlowType = flow.flow_type ?? (types.includes("team") || flow.definition.nodes.filter((node) => node.type === "agent").length > 1 ? "team" : "agent");
 
   return {
     id: flow.id,
     name: flow.name,
+    flowType: inferredFlowType,
     status: flow.status === "published" ? "published" : "draft",
+    latestVersion: flow.latest_version,
     updatedAt: formatBackendTime(flow.updated_at ?? flow.created_at),
-    agents,
+    resources,
+    types,
     description: flow.description || "本地后端 Flow",
     definition: flow.definition,
   };
@@ -368,6 +374,8 @@ const backendNodeToStudioNode = (node: BackendFlowNode): Node<StudioNodeData> =>
       data: {
         kind: "team",
         label: node.data.label,
+        teamId: node.data.team_id ?? undefined,
+        teamName: node.data.label,
         teamDescription: node.data.description ?? "",
         teamStrategy: node.data.strategy,
         memberAgentIds: node.data.member_agent_ids,
@@ -437,6 +445,7 @@ const nodesToBackendDefinition = (nodes: Node<StudioNodeData>[], edges: Edge[]):
         position: node.position,
         data: {
           label: node.data.label,
+          team_id: node.data.teamId ?? null,
           description: node.data.teamDescription ?? null,
           member_agent_ids: node.data.memberAgentIds ?? [],
           strategy: node.data.teamStrategy ?? "parallel",
@@ -500,6 +509,30 @@ const mcpSections = [
   { title: "统一协议", value: "按资源 Resource 接入，不散落特殊逻辑" },
   { title: "目标", value: "先把接入点做稳，再补生态兼容" },
 ];
+
+const stringifyRunOutput = (value: unknown) => {
+  if (value == null) {
+    return "";
+  }
+
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (typeof value === "object" && "result" in value && typeof value.result === "string") {
+    return value.result;
+  }
+
+  if (typeof value === "object" && "final_text" in value && typeof value.final_text === "string") {
+    return value.final_text;
+  }
+
+  if (typeof value === "object" && "message" in value && typeof value.message === "string") {
+    return value.message;
+  }
+
+  return JSON.stringify(value, null, 2);
+};
 
 function AppGlyph({ icon }: { icon: DesktopApp["icon"] }) {
   if (icon === "grid") {
@@ -801,6 +834,7 @@ function RunConsole(props: {
   isRunning: boolean;
   events: BackendRunStreamEvent[];
   result: BackendRunDetail | null;
+  showResult?: boolean;
 }) {
   const lastEvent = props.events.at(-1);
 
@@ -821,19 +855,306 @@ function RunConsole(props: {
           props.events.map((item, index) => (
             <div key={`${item.event}_${index}`} className="run-console-event">
               <span>{item.event}</span>
-              <pre>{JSON.stringify(item.data, null, 2)}</pre>
+              <pre>{formatRunEventSummary(item)}</pre>
             </div>
           ))
         )}
       </div>
 
-      {props.result ? (
+      {props.showResult !== false && props.result ? (
         <div className="run-console-result">
           <span>Final Output</span>
           <pre>{JSON.stringify(props.result.output, null, 2)}</pre>
         </div>
       ) : null}
     </div>
+  );
+}
+
+function formatRunEventSummary(item: BackendRunStreamEvent) {
+  const data = item.data as Record<string, unknown>;
+  const output = data.output as Record<string, unknown> | undefined;
+
+  if (item.event === "run.started") {
+    return `status: ${String(data.status ?? "running")}\nrun: ${String(data.run_id ?? "-")}`;
+  }
+
+  if (item.event === "step.started") {
+    return `node: ${String(data.node_id ?? "-")}\nagent: ${String(data.agent_id ?? data.node_type ?? "-")}`;
+  }
+
+  if (item.event === "step.completed") {
+    const message = typeof output?.message === "string" ? output.message : "step completed";
+    return trimConsoleText(message);
+  }
+
+  if (item.event === "run.completed") {
+    const finalOutput = data.output as Record<string, unknown> | undefined;
+    const finalText = typeof finalOutput?.final_text === "string" ? finalOutput.final_text : String(data.status ?? "completed");
+    return trimConsoleText(finalText);
+  }
+
+  if (item.event === "step.failed" || item.event === "run.failed") {
+    return trimConsoleText(String(data.error ?? "failed"));
+  }
+
+  return trimConsoleText(JSON.stringify(item.data, null, 2));
+}
+
+function trimConsoleText(value: string) {
+  return value.length > 220 ? `${value.slice(0, 220)}...` : value;
+}
+
+type HomeChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+};
+
+const DEFAULT_HOME_PROMPT = "你可以帮我干啥";
+
+function HomeFlowConsole() {
+  const [flows, setFlows] = useState<BackendFlowSummary[]>([]);
+  const [selectedFlowId, setSelectedFlowId] = useState("");
+  const [prompt, setPrompt] = useState(DEFAULT_HOME_PROMPT);
+  const [messages, setMessages] = useState<HomeChatMessage[]>([]);
+  const [events, setEvents] = useState<BackendRunStreamEvent[]>([]);
+  const [result, setResult] = useState<BackendRunDetail | null>(null);
+  const [isRunning, setIsRunning] = useState(false);
+  const [error, setError] = useState("");
+  const chatStreamRef = useRef<HTMLDivElement | null>(null);
+  const shouldAutoScrollRef = useRef(true);
+
+  const scrollChatToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
+    const stream = chatStreamRef.current;
+    if (!stream) {
+      return;
+    }
+
+    stream.scrollTo({
+      top: stream.scrollHeight,
+      behavior,
+    });
+  }, []);
+
+  const handleChatScroll = useCallback(() => {
+    const stream = chatStreamRef.current;
+    if (!stream) {
+      return;
+    }
+
+    const distanceToBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight;
+    shouldAutoScrollRef.current = distanceToBottom < 48;
+  }, []);
+
+  useEffect(() => {
+    if (!shouldAutoScrollRef.current) {
+      return;
+    }
+
+    scrollChatToBottom(isRunning ? "auto" : "smooth");
+  }, [messages, isRunning, scrollChatToBottom]);
+
+  useEffect(() => {
+    let mounted = true;
+
+    async function loadFlows() {
+      try {
+        const backendFlows = await listBackendFlows();
+
+        if (!mounted) {
+          return;
+        }
+
+        setFlows(backendFlows);
+        setSelectedFlowId((current) => current || backendFlows[0]?.id || "");
+      } catch (loadError) {
+        if (mounted) {
+          setError(loadError instanceof Error ? loadError.message : "读取 Flow 失败");
+        }
+      }
+    }
+
+    void loadFlows();
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const selectedFlow = flows.find((flow) => flow.id === selectedFlowId) ?? flows[0];
+
+  const runSelectedFlow = async () => {
+    if (!selectedFlow || !prompt.trim() || isRunning) {
+      return;
+    }
+
+    const userText = prompt.trim();
+    const history = messages;
+    const assistantMessageId = `assistant_${Date.now()}`;
+    setEvents([]);
+    setResult(null);
+    setError("");
+    setIsRunning(true);
+    setPrompt("");
+    shouldAutoScrollRef.current = true;
+    setMessages((current) => [
+      ...current,
+      { id: `user_${Date.now()}`, role: "user", content: userText },
+      { id: assistantMessageId, role: "assistant", content: "" },
+    ]);
+    requestAnimationFrame(() => scrollChatToBottom("smooth"));
+
+    try {
+      let streamedResult: BackendRunDetail | null = null;
+
+      await streamBackendFlowRun(selectedFlow.id, {
+        user_message: userText,
+        messages: history.map((item) => ({ role: item.role, content: item.content })),
+        session_id: "home",
+      }, (event) => {
+        if (event.event === "token.delta") {
+          const delta = typeof event.data.delta === "string" ? event.data.delta : "";
+          if (delta) {
+            setMessages((current) =>
+              current.map((item) =>
+                item.id === assistantMessageId ? { ...item, content: item.content + delta } : item,
+              ),
+            );
+          }
+          return;
+        }
+
+        if (event.event === "team.placeholder.completed") {
+          const output = event.data.output as { message?: unknown } | undefined;
+          const message = typeof output?.message === "string" ? output.message : "";
+          if (message) {
+            setMessages((current) =>
+              current.map((item) =>
+                item.id === assistantMessageId && !item.content ? { ...item, content: message } : item,
+              ),
+            );
+          }
+        }
+
+        setEvents((current) => [...current, event]);
+
+        if (event.event === "run.completed") {
+          streamedResult = event.data as unknown as BackendRunDetail;
+        }
+      });
+
+      const finalResult = streamedResult ?? (await runBackendFlow(selectedFlow.id, {
+        user_message: userText,
+        messages: history.map((item) => ({ role: item.role, content: item.content })),
+        session_id: "home",
+      }));
+      setResult(finalResult);
+      const finalText = stringifyRunOutput(finalResult.output);
+      if (finalText) {
+        setMessages((current) =>
+          current.map((item) =>
+            item.id === assistantMessageId && !item.content ? { ...item, content: finalText } : item,
+          ),
+        );
+      }
+    } catch (runError) {
+      setError(runError instanceof Error ? runError.message : "运行 Flow 失败");
+      setMessages((current) =>
+        current.map((item) =>
+          item.id === assistantMessageId && !item.content
+            ? { ...item, content: "运行失败，请查看右侧事件流或后端日志。" }
+            : item,
+        ),
+      );
+    } finally {
+      setIsRunning(false);
+    }
+  };
+
+  return (
+    <section className="home-console">
+      <div className="home-console-head">
+        <div className="home-console-title">
+          <span>Agent Console</span>
+          <h1>{selectedFlow?.name ?? "选择一个 Flow"}</h1>
+          <p>{isRunning ? "正在流式执行..." : "输入任务，交给当前编排好的 Agent 工作流处理。"}</p>
+        </div>
+        <div className="home-flow-actions">
+          <label className="home-flow-picker">
+            <span>Flow</span>
+            <select
+              value={selectedFlow?.id ?? ""}
+              disabled={flows.length === 0 || isRunning}
+              onChange={(event) => setSelectedFlowId(event.target.value)}
+            >
+              {flows.length === 0 ? <option value="">暂无 Flow</option> : null}
+              {flows.map((flow) => (
+                <option key={flow.id} value={flow.id}>
+                  {flow.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            className="flow-secondary-button"
+            disabled={isRunning || messages.length === 0}
+            onClick={() => {
+              setMessages([]);
+              setEvents([]);
+              setResult(null);
+              setError("");
+            }}
+          >
+            清空对话
+          </button>
+        </div>
+      </div>
+
+      <div className="home-console-grid">
+        <div className="home-chat-panel">
+          <div ref={chatStreamRef} className="home-chat-stream" onScroll={handleChatScroll}>
+            {messages.length === 0 ? (
+              <div className="home-message is-agent">
+                <span>{selectedFlow?.name ?? "Flow Agent"}</span>
+                <p>输入一个任务，我会以流式方式运行编排，并在本页面保留短期上下文。</p>
+              </div>
+            ) : null}
+            {messages.map((message) => (
+              <div key={message.id} className={`home-message ${message.role === "user" ? "is-user" : "is-agent"}`}>
+                <span>{message.role === "user" ? "你" : selectedFlow?.name ?? "Flow Agent"}</span>
+                {message.content ? <div className="home-message-content">{message.content}</div> : <p>正在生成...</p>}
+              </div>
+            ))}
+            {error ? <p className="home-error">{error}</p> : null}
+          </div>
+
+          <form
+            className="home-composer"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void runSelectedFlow();
+            }}
+          >
+            <input
+              value={prompt}
+              onChange={(event) => setPrompt(event.target.value)}
+              placeholder="输入任务，按 Enter 发送"
+            />
+            <button
+              type="submit"
+              className="flow-primary-button"
+              disabled={!selectedFlow || !prompt.trim() || isRunning}
+            >
+              {isRunning ? "运行中" : "发送"}
+            </button>
+          </form>
+        </div>
+
+        <RunConsole title="Run Timeline" isRunning={isRunning} events={events} result={result} showResult={false} />
+      </div>
+    </section>
   );
 }
 
@@ -846,13 +1167,17 @@ function FlowStudioContent() {
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [newFlowName, setNewFlowName] = useState("");
   const [newFlowDescription, setNewFlowDescription] = useState("");
+  const [newFlowType, setNewFlowType] = useState<"agent" | "team">("agent");
   const [backendAgents, setBackendAgents] = useState<BackendAgent[]>([]);
+  const [backendTeams, setBackendTeams] = useState<BackendTeam[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [isFlowSettingsOpen, setIsFlowSettingsOpen] = useState(false);
   const [focusNodeId, setFocusNodeId] = useState<string | null>(null);
   const [centerSignal, setCenterSignal] = useState(0);
   const [canvasNotice, setCanvasNotice] = useState<string>("");
   const [flowError, setFlowError] = useState<string>("");
   const [isFlowLoading, setIsFlowLoading] = useState(false);
+  const [isFlowSaving, setIsFlowSaving] = useState(false);
   const [runResult, setRunResult] = useState<BackendRunDetail | null>(null);
   const [runEvents, setRunEvents] = useState<BackendRunStreamEvent[]>([]);
   const [isRunStreaming, setIsRunStreaming] = useState(false);
@@ -864,6 +1189,14 @@ function FlowStudioContent() {
 
   const selectedFlow = flows.find((flow) => flow.id === selectedFlowId) ?? flows[0];
   const agentOptions = backendAgents;
+  const teamOptions = backendTeams;
+  const updateSelectedFlow = (patch: Partial<Pick<FlowRecord, "name" | "description" | "flowType">>) => {
+    if (!selectedFlow) {
+      return;
+    }
+
+    setFlows((current) => current.map((flow) => (flow.id === selectedFlow.id ? { ...flow, ...patch } : flow)));
+  };
   const [nodes, setNodes, onNodesChange] = useNodesState<StudioFlowNode>(selectedFlow ? createNodesFromDefinition(selectedFlow.definition) : []);
   const [edges, setEdges, onEdgesChange] = useEdgesState(selectedFlow ? createEdgesFromDefinition(selectedFlow.definition) : []);
 
@@ -882,7 +1215,7 @@ function FlowStudioContent() {
       setFlowError("");
 
       try {
-        const [backendFlows, agents] = await Promise.all([listBackendFlows(), listBackendAgents()]);
+        const [backendFlows, agents, teams] = await Promise.all([listBackendFlows(), listBackendAgents(), listBackendTeams()]);
 
         if (!mounted) {
           return;
@@ -895,11 +1228,13 @@ function FlowStudioContent() {
         setFlows(records);
         setSelectedFlowId(routeFlow?.id ?? records[0]?.id ?? "");
         setBackendAgents(agents);
+        setBackendTeams(teams);
       } catch (error) {
         if (mounted) {
           setFlows([]);
           setSelectedFlowId("");
           setBackendAgents([]);
+          setBackendTeams([]);
           setNodes([]);
           setEdges([]);
           setFlowError(error instanceof Error ? error.message : "本地后端暂不可用，请确认 7000 端口服务已启动。");
@@ -938,7 +1273,8 @@ function FlowStudioContent() {
     setNodes(createNodesFromDefinition(selectedFlow.definition));
     setEdges(createEdgesFromDefinition(selectedFlow.definition));
     const initialAgentNode = selectedFlow.definition.nodes.find((node) => node.type === "agent")?.id ?? null;
-    setSelectedNodeId(initialAgentNode);
+    setSelectedNodeId(null);
+    setIsFlowSettingsOpen(true);
     setFocusNodeId(initialAgentNode);
     setRunResult(null);
     setRunEvents([]);
@@ -1047,12 +1383,14 @@ function FlowStudioContent() {
         },
         data: {
           kind,
-          label: kind === "agent" ? agentOptions[0]?.name ?? "Agent Node" : kind === "team" ? "Agent Team" : config.label,
+          label: kind === "agent" ? agentOptions[0]?.name ?? "Agent Node" : kind === "team" ? teamOptions[0]?.name ?? "Agent Team" : config.label,
           agentName: kind === "agent" ? agentOptions[0]?.name : undefined,
           agentId: kind === "agent" ? agentOptions[0]?.id : undefined,
-          teamDescription: kind === "team" ? "并列执行一组已有 Agent，适合处理 todo list 拆分后的同级任务。" : undefined,
-          teamStrategy: kind === "team" ? "parallel" : undefined,
-          memberAgentIds: kind === "team" ? agentOptions.slice(0, 2).map((agent) => agent.id) : undefined,
+          teamId: kind === "team" ? teamOptions[0]?.id : undefined,
+          teamName: kind === "team" ? teamOptions[0]?.name : undefined,
+          teamDescription: kind === "team" ? teamOptions[0]?.description ?? "并列执行一组已有 Agent，适合处理 todo list 拆分后的同级任务。" : undefined,
+          teamStrategy: kind === "team" ? teamOptions[0]?.strategy ?? "parallel" : undefined,
+          memberAgentIds: kind === "team" ? teamOptions[0]?.member_agent_ids ?? agentOptions.slice(0, 2).map((agent) => agent.id) : undefined,
         },
         style: {
           background: config.color,
@@ -1079,14 +1417,20 @@ function FlowStudioContent() {
       );
     }
 
+    if (kind === "team" || (kind === "agent" && nodes.filter((node) => node.data.kind === "agent").length >= 1)) {
+      updateSelectedFlow({ flowType: "team" });
+    }
+
     setNodeSelectorAnchor(null);
     setSelectedNodeId(id);
+    setIsFlowSettingsOpen(false);
     setFocusNodeId(id);
     setCanvasNotice(`${config.label} 节点已添加`);
   };
 
   const openNodeSelectorFromNode = (sourceNodeId: string, screenPosition: { x: number; y: number }) => {
     setSelectedNodeId(sourceNodeId);
+    setIsFlowSettingsOpen(false);
     setNodeSelectorAnchor({ sourceNodeId, ...screenPosition });
   };
 
@@ -1201,6 +1545,7 @@ function FlowStudioContent() {
       const created = await createBackendFlow({
         name: normalizedName,
         description: newFlowDescription.trim() || "新的多 Agent 工作流，等待进入画布继续配置。",
+        flow_type: newFlowType,
         owner_user_id: "local_user",
         workspace_id: "local_workspace",
         definition: nodesToBackendDefinition(nodes, edges),
@@ -1213,11 +1558,38 @@ function FlowStudioContent() {
       setIsCreateModalOpen(false);
       setNewFlowName("");
       setNewFlowDescription("");
+      setNewFlowType("agent");
       setCanvasNotice("Flow 已保存到本地后端");
     } catch (error) {
       setFlowError(error instanceof Error ? error.message : "后端保存失败，请确认 7000 端口服务已启动。");
     } finally {
       setIsFlowLoading(false);
+    }
+  };
+
+  const saveCurrentFlow = async () => {
+    if (!selectedFlow) {
+      return;
+    }
+
+    setIsFlowSaving(true);
+    setFlowError("");
+
+    try {
+      const updated = await updateBackendFlow(selectedFlow.id, {
+        name: selectedFlow.name,
+        description: selectedFlow.description,
+        flow_type: selectedFlow.flowType,
+        definition: nodesToBackendDefinition(nodes, edges),
+      });
+      const record = backendFlowToRecord(updated);
+
+      setFlows((current) => current.map((flow) => (flow.id === record.id ? record : flow)));
+      setCanvasNotice(`Flow 已保存，版本 v${record.latestVersion}`);
+    } catch (error) {
+      setFlowError(error instanceof Error ? error.message : "保存 Flow 失败，请确认后端 7000 正常运行。");
+    } finally {
+      setIsFlowSaving(false);
     }
   };
 
@@ -1288,6 +1660,9 @@ function FlowStudioContent() {
               <button type="button" className="flow-secondary-button" onClick={() => setIsCreateModalOpen(true)}>
                 新建 Flow
               </button>
+              <button type="button" className="flow-secondary-button" onClick={saveCurrentFlow} disabled={isFlowSaving}>
+                {isFlowSaving ? "保存中..." : "保存 Flow"}
+              </button>
               <button type="button" className="flow-primary-button" onClick={runCurrentFlow}>
                 {isRunStreaming ? "运行中..." : "运行调试"}
               </button>
@@ -1296,7 +1671,7 @@ function FlowStudioContent() {
 
           {flowError ? <div className="flow-inline-alert">{flowError}</div> : null}
 
-          <div className={`flow-editor-shell ${selectedNodeId ? 'has-panel-open' : ''}`}>
+          <div className={`flow-editor-shell ${selectedNodeId || isFlowSettingsOpen ? 'has-panel-open' : ''}`}>
             <section className="flow-editor-canvas">
               {canvasNotice ? <div className="flow-canvas-notice">{canvasNotice}</div> : null}
               <ReactFlowProvider>
@@ -1306,9 +1681,13 @@ function FlowStudioContent() {
                   onNodesChange={onNodesChange}
                   onEdgesChange={onEdgesChange}
                   onConnect={onConnect}
-                  onNodeClick={(_, node) => setSelectedNodeId(node.id)}
+                  onNodeClick={(_, node) => {
+                    setSelectedNodeId(node.id);
+                    setIsFlowSettingsOpen(false);
+                  }}
                   onPaneClick={() => {
                     setSelectedNodeId(null);
+                    setIsFlowSettingsOpen(true);
                     setNodeSelectorAnchor(null);
                   }}
                   onAddNodeClick={openNodeSelectorFromNode}
@@ -1324,16 +1703,19 @@ function FlowStudioContent() {
               />
             </section>
 
-            <aside className={`flow-editor-panel ${selectedNodeId ? 'is-open' : ''}`}>
+            <aside className={`flow-editor-panel ${selectedNodeId || isFlowSettingsOpen ? 'is-open' : ''}`}>
               <div className="config-panel-head">
                 <div className="config-panel-title">
-                  <strong>{selectedNode?.data.kind === "agent" ? "Agent 参数" : "节点配置"}</strong>
-                  {selectedNode ? <span>{selectedNode.data.kind} · {selectedNode.id}</span> : null}
+                  <strong>{selectedNode ? selectedNode.data.kind === "agent" ? "Agent 参数" : selectedNode.data.kind === "team" ? "Team 参数" : "节点配置" : "整体设置"}</strong>
+                  {selectedNode ? <span>{selectedNode.data.kind} · {selectedNode.id}</span> : selectedFlow ? <span>{selectedFlow.flowType} · {selectedFlow.id}</span> : null}
                 </div>
                 <button
                   type="button"
                   className="panel-close-button"
-                  onClick={() => setSelectedNodeId(null)}
+                  onClick={() => {
+                    setSelectedNodeId(null);
+                    setIsFlowSettingsOpen(false);
+                  }}
                   aria-label="关闭面板"
                 >
                   ×
@@ -1438,6 +1820,33 @@ function FlowStudioContent() {
                             </button>
                           </div>
                         </FormProvider>
+                      ) : null}
+                      {selectedNode.data.kind === "team" ? (
+                        <label className="flow-field flow-field-compact">
+                          <span>绑定 Team</span>
+                          <select
+                            value={selectedNode.data.teamId ?? teamOptions[0]?.id ?? ""}
+                            disabled={teamOptions.length === 0}
+                            onChange={(event) => {
+                              const team = teamOptions.find((item) => item.id === event.target.value);
+                              updateSelectedNode({
+                                teamId: event.target.value,
+                                teamName: team?.name ?? event.target.value,
+                                label: team?.name ?? event.target.value,
+                                teamDescription: team?.description ?? "",
+                                teamStrategy: team?.strategy ?? "parallel",
+                                memberAgentIds: team?.member_agent_ids ?? [],
+                              });
+                            }}
+                          >
+                            {teamOptions.length === 0 ? <option value="">暂无后端 Team</option> : null}
+                            {teamOptions.map((team) => (
+                              <option key={team.id} value={team.id}>
+                                {team.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
                       ) : null}
                       {selectedNode.data.kind === "agent" || selectedNode.data.kind === "team" ? (
                         <div className="retry-config-card">
@@ -1673,7 +2082,60 @@ function FlowStudioContent() {
                     />
                   </>
                 ) : (
-                  <span>先点击画布中的节点，再在这里编辑配置。</span>
+                  selectedFlow ? (
+                    <>
+                      <div className="config-panel-scroll">
+                        <div className="flow-settings-card">
+                          <div className="config-section-title">
+                            <strong>Flow / Team 整体配置</strong>
+                            <span>点击节点可切换到节点参数</span>
+                          </div>
+
+                          <label className="flow-field flow-field-compact">
+                            <span>名称</span>
+                            <input
+                              value={selectedFlow.name}
+                              onChange={(event) => updateSelectedFlow({ name: event.target.value })}
+                            />
+                          </label>
+
+                          <label className="flow-field flow-field-compact">
+                            <span>类型</span>
+                            <select
+                              value={selectedFlow.flowType}
+                              onChange={(event) => updateSelectedFlow({ flowType: event.target.value as "agent" | "team" })}
+                            >
+                              <option value="agent">Agent 单 Agent</option>
+                              <option value="team">Team 多 Agent</option>
+                            </select>
+                          </label>
+
+                          <label className="flow-field flow-field-compact">
+                            <span>描述</span>
+                            <textarea
+                              rows={3}
+                              value={selectedFlow.description}
+                              onChange={(event) => updateSelectedFlow({ description: event.target.value })}
+                            />
+                          </label>
+
+                          <div className="flow-settings-summary">
+                            <span>节点数：{nodes.length}</span>
+                            <span>Agent：{nodes.filter((node) => node.data.kind === "agent").length}</span>
+                            <span>Team：{nodes.filter((node) => node.data.kind === "team").length}</span>
+                          </div>
+                        </div>
+                      </div>
+                      <RunConsole
+                        title="Run Console"
+                        isRunning={isRunStreaming}
+                        events={runEvents}
+                        result={runResult}
+                      />
+                    </>
+                  ) : (
+                    <span>先创建或打开一个 Flow。</span>
+                  )
                 )}
               </div>
             </aside>
@@ -1698,6 +2160,13 @@ function FlowStudioContent() {
                 <label className="flow-field">
                   <span>Flow 名称</span>
                   <input value={newFlowName} onChange={(event) => setNewFlowName(event.target.value)} placeholder="例如：Customer Support Flow" />
+                </label>
+                <label className="flow-field">
+                  <span>类型</span>
+                  <select value={newFlowType} onChange={(event) => setNewFlowType(event.target.value as "agent" | "team")}>
+                    <option value="agent">Agent 单 Agent</option>
+                    <option value="team">Team 多 Agent</option>
+                  </select>
                 </label>
                 <label className="flow-field">
                   <span>描述</span>
@@ -1765,7 +2234,8 @@ function FlowStudioContent() {
 
                 <div className="agent-row-meta">
                   <span>{flow.status}</span>
-                  <span>{flow.agents.length ? flow.agents.join(" / ") : "未绑定 Agent"}</span>
+                  <span>{flow.flowType === "team" ? "Team" : "Agent"}</span>
+                  <span>{flow.resources.length ? flow.resources.join(" / ") : "未绑定资源"}</span>
                   <span>{flow.updatedAt}</span>
                 </div>
 
@@ -1831,30 +2301,109 @@ function FlowStudioContent() {
   );
 }
 
+function AgentsWorkspace() {
+  const [agents, setAgents] = useState<BackendAgent[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadAgents = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const nextAgents = await listBackendAgents();
+      setAgents(nextAgents);
+    } catch (agentError) {
+      setAgents([]);
+      setError(agentError instanceof Error ? agentError.message : "读取 Agent 列表失败");
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadAgents();
+  }, [loadAgents]);
+
+  return (
+    <section className="workspace-canvas workspace-canvas-plain">
+      <div className="content-doc content-doc-flow agent-hub-page">
+        <div className="flow-page-header">
+          <div>
+            <h2>Agent Hub</h2>
+            <p>先创建和维护单个 Agent，再在 Flow / Team 里选择它们完成编排。</p>
+          </div>
+          <div className="flow-header-actions">
+            <button type="button" className="flow-secondary-button" onClick={loadAgents} disabled={isLoading}>
+              {isLoading ? "刷新中" : "刷新"}
+            </button>
+            <button type="button" className="flow-primary-button" disabled title="下一步接创建 Agent 表单">
+              新建 Agent
+            </button>
+          </div>
+        </div>
+
+        {error ? <div className="flow-error">{error}</div> : null}
+
+        <div className="agent-hub-summary">
+          <span>{agents.length} 个 Agent</span>
+          <span>{agents.filter((agent) => agent.stream).length} 个流式输出</span>
+          <span>{agents.filter((agent) => agent.status === "active").length} 个启用中</span>
+        </div>
+
+        <div className="flow-list-card agent-hub-list">
+          {isLoading ? (
+            <div className="empty-flow-card">
+              <strong>正在加载 Agent</strong>
+              <p>从后端读取你已经创建好的单 Agent。</p>
+            </div>
+          ) : agents.length === 0 ? (
+            <div className="empty-flow-card">
+              <strong>暂无 Agent</strong>
+              <p>真实流程里应该先在这里创建荷官、玩家、裁判等 Agent，再去 Flow 编排。</p>
+            </div>
+          ) : (
+            agents.map((agent) => (
+              <article key={agent.id} className="agent-row agent-hub-row">
+                <div className="agent-row-main">
+                  <span className={`agent-status ${agent.status === "active" ? "agent-status-active" : "agent-status-draft"}`} />
+                  <div>
+                    <strong>{agent.name}</strong>
+                    <p>{agent.description || agent.role || "暂无描述"}</p>
+                  </div>
+                </div>
+                <div className="agent-row-meta">
+                  <span>{agent.stream ? "stream" : "normal"}</span>
+                  <span>{agent.status}</span>
+                  <span>{agent.owner_user_id || "local"}</span>
+                </div>
+                <div className="agent-row-actions">
+                  <span className="agent-row-id">{agent.id}</span>
+                </div>
+              </article>
+            ))
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function AppWindowContent({ app }: { app: DesktopApp }) {
   if (app.id === "home") {
-    return (
-      <div className="content-doc content-doc-home">
-        <span className="hero-pill">Agent Studio v1.0</span>
-        <h1>多 Agent 编排工作台</h1>
-        <p>围绕 Flow、Agent、Skill、知识库和 MCP 组织你的工作入口。</p>
-        <ul className="content-list content-list-inline">
-          {homeHighlights.map((item) => (
-            <li key={item}>{item}</li>
-          ))}
-        </ul>
-      </div>
-    );
+    return <HomeFlowConsole />;
   }
 
   if (app.id === "flow") {
     return <FlowStudioContent />;
   }
 
+  if (app.id === "agents") {
+    return <AgentsWorkspace />;
+  }
+
   const sections =
-    app.id === "agents"
-      ? agentSections
-      : app.id === "skills"
+    app.id === "skills"
         ? skillSections
         : app.id === "knowledge"
           ? knowledgeSections
@@ -2031,9 +2580,15 @@ export default function HomePage() {
             <span className="status-light" />
             v1.0
           </span>
-          <button type="button">Flows</button>
-          <button type="button">Agents</button>
-          <button type="button">Runs</button>
+          <button type="button" onClick={() => openApp("flow")}>
+            Flows
+          </button>
+          <button type="button" onClick={() => openApp("agents")}>
+            Agents
+          </button>
+          <button type="button" onClick={() => openApp("home")}>
+            Runs
+          </button>
           <div className="avatar">WS</div>
         </nav>
       </header>

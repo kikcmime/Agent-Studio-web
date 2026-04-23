@@ -23,6 +23,8 @@ export type BackendAgent = {
   description?: string | null;
   role?: string | null;
   status: string;
+  owner_user_id?: string | null;
+  workspace_id?: string | null;
   stream?: boolean;
   debug?: boolean;
 };
@@ -39,6 +41,17 @@ export type BackendAgentDetail = BackendAgent & {
   tool_ids: string[];
   skill_ids: string[];
   knowledge_ids: string[];
+};
+
+export type BackendTeam = {
+  id: string;
+  name: string;
+  description?: string | null;
+  strategy: "parallel" | "sequential";
+  member_agent_ids: string[];
+  status: string;
+  version?: number;
+  updated_at?: string | null;
 };
 
 export type BackendFlowNode =
@@ -67,6 +80,7 @@ export type BackendFlowNode =
       position: { x: number; y: number };
       data: {
         label: string;
+        team_id?: string | null;
         description?: string | null;
         member_agent_ids: string[];
         strategy: "parallel" | "sequential";
@@ -110,6 +124,7 @@ export type BackendFlowSummary = {
   id: string;
   name: string;
   description?: string | null;
+  flow_type: "agent" | "team";
   status: "draft" | "published" | "archived";
   latest_version: number;
   created_at?: string | null;
@@ -183,6 +198,14 @@ export function getBackendAgent(agentId: string) {
   return request<BackendAgentDetail>(`/agents/${agentId}`);
 }
 
+export function listBackendTeams() {
+  return request<BackendTeam[]>("/teams");
+}
+
+export function getBackendTeam(teamId: string) {
+  return request<BackendTeam>(`/teams/${teamId}`);
+}
+
 export function updateBackendAgent(agentId: string, payload: Partial<{
   name: string;
   description: string | null;
@@ -203,12 +226,25 @@ export function updateBackendAgent(agentId: string, payload: Partial<{
 export function createBackendFlow(payload: {
   name: string;
   description?: string;
+  flow_type?: "agent" | "team";
   owner_user_id?: string;
   workspace_id?: string;
   definition: BackendFlowDefinition;
 }) {
   return request<BackendFlow>("/flows", {
     method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateBackendFlow(flowId: string, payload: {
+  name?: string;
+  description?: string | null;
+  flow_type?: "agent" | "team";
+  definition?: BackendFlowDefinition;
+}) {
+  return request<BackendFlow>(`/flows/${flowId}`, {
+    method: "PUT",
     body: JSON.stringify(payload),
   });
 }
