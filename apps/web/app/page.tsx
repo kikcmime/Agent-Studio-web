@@ -23,17 +23,31 @@ import {
 } from "@xyflow/react";
 import { createForm } from "@formily/core";
 import { Field, FormProvider } from "@formily/react";
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
+import { AgentsWorkspace } from "../features/agents/components/agents-workspace";
+import {
+  createTeamWrapperDefinition,
+  joinIds,
+  splitIds,
+} from "../features/agents/lib/agent-assets";
 import {
   flowStudioNodeConfigs,
   getFlowStudioNodeConfig,
   type FlowStudioNodeKind,
 } from "../features/flow/model/node-config";
+import { HomeFlowConsole } from "../features/home/components/home-flow-console";
+import { RunConsole } from "../features/shared/components/run-console";
 import {
-  createBackendFlow,
+  createBackendAgent,
   getBackendAgent,
   getBackendFlow,
-  getBackendTeam,
   listBackendAgents,
   listBackendFlows,
   listBackendTeams,
@@ -51,8 +65,17 @@ import {
   type BackendRunStreamEvent,
   type BackendTeam,
 } from "../features/flow/model/flow-api";
-
-type AppId = "home" | "flow" | "agents" | "skills" | "knowledge" | "mcp";
+import {
+  readHomeConsoleConfigMap,
+  writeHomeConsoleConfigMap,
+  type HomeConsoleConfig,
+} from "../features/workspace/lib/directory-storage";
+import {
+  type AppId,
+  isAppId,
+  readQueryParam,
+  replaceRouteQuery,
+} from "../features/workspace/lib/router-state";
 type WindowMode = "normal" | "maximized" | "minimized";
 
 type DesktopApp = {
@@ -62,6 +85,7 @@ type DesktopApp = {
   color: string;
   icon: string;
   summary: string;
+  hidden?: boolean;
 };
 
 const apps: DesktopApp[] = [
@@ -74,20 +98,29 @@ const apps: DesktopApp[] = [
     summary: "项目总览、目标和版本节奏。",
   },
   {
-    id: "flow",
-    label: "Flow Studio",
-    short: "Flow",
-    color: "linear-gradient(135deg, #18181b, #4b5563)",
+    id: "studio",
+    label: "Studio",
+    short: "Studio",
+    color: "linear-gradient(135deg, #c7d2fe, #6ee7b7)",
     icon: "ring",
-    summary: "编排多 Agent 工作流，配置节点与运行路径。",
+    summary: "只查看对外暴露数字人的结构、运行与入口状态。",
+  },
+  {
+    id: "flow",
+    label: "编排",
+    short: "Flow",
+    color: "linear-gradient(135deg, #c7d2fe, #6ee7b7)",
+    icon: "ring",
+    summary: "编辑当前 Agent / Team 的节点、路径和回溯逻辑。",
+    hidden: true,
   },
   {
     id: "agents",
-    label: "Agent Hub",
-    short: "Agent",
-    color: "linear-gradient(135deg, #0f172a, #6d7bff)",
+    label: "我的数字人",
+    short: "Agents",
+    color: "linear-gradient(135deg, #8fdcc2, #9ea7ff)",
     icon: "code",
-    summary: "管理 Agent 模型、Prompt 与资源绑定。",
+    summary: "统一管理可执行的 Agent 与 Team。",
   },
   {
     id: "skills",
@@ -115,40 +148,13 @@ const apps: DesktopApp[] = [
   },
 ];
 
-const isAppId = (value: string | null): value is AppId =>
-  Boolean(value && apps.some((app) => app.id === value));
-
-const readQueryParam = (key: string) => {
-  if (typeof window === "undefined") {
-    return null;
-  }
-
-  return new URLSearchParams(window.location.search).get(key);
-};
-
-const replaceRouteQuery = (patch: Record<string, string | null>) => {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  const url = new URL(window.location.href);
-
-  Object.entries(patch).forEach(([key, value]) => {
-    if (value == null || value === "") {
-      url.searchParams.delete(key);
-    } else {
-      url.searchParams.set(key, value);
-    }
-  });
-
-  window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
-};
-
 type FlowRecord = {
   id: string;
   name: string;
   flowType: "agent" | "team";
   status: "draft" | "published";
+  isExposed: boolean;
+  isPrimary: boolean;
   latestVersion: number;
   updatedAt: string;
   resources: string[];
@@ -170,7 +176,12 @@ type StudioNodeData = {
   maxRetry?: number;
   onFail?: string;
   // Condition node fields
-  conditionType?: "expression" | "llm_classify" | "regex" | "json_schema" | "simple";
+  conditionType?:
+    | "expression"
+    | "llm_classify"
+    | "regex"
+    | "json_schema"
+    | "simple";
   inputSource?: string;
   expression?: string;
   llmConfig?: {
@@ -180,8 +191,16 @@ type StudioNodeData = {
   };
   regexPatterns?: { pattern: string; branchId: string }[];
   jsonSchema?: object;
-  branches?: { id: string; label: string; conditionValue?: string; targetNodeId?: string }[];
+  branches?: {
+    id: string;
+    label: string;
+    conditionValue?: string;
+    targetNodeId?: string;
+  }[];
   defaultBranchId?: string;
+  isVirtualMember?: boolean;
+  parentTeamNodeId?: string;
+  memberCount?: number;
 };
 
 type StudioFlowNode = Node<StudioNodeData>;
@@ -198,6 +217,14 @@ type AgentDraft = {
   stream: boolean;
   debug: boolean;
 };
+
+const splitPromptLines = (value: string) =>
+  value
+    .split(/\n+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+const joinPromptLines = (value?: string[]) => (value ?? []).join("\n");
 
 type SelectOption = {
   label: string;
@@ -217,20 +244,15 @@ const emptyAgentDraft: AgentDraft = {
   debug: false,
 };
 
-const splitIds = (value: string) =>
-  value
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-
-const joinIds = (value?: string[]) => (value && value.length > 0 ? value.join(", ") : "");
-
 const agentDetailToDraft = (agent: BackendAgentDetail): AgentDraft => ({
   name: agent.name,
   description: agent.description ?? "",
   instructions: agent.instructions ?? "",
   model: agent.model_config.model ?? "",
-  temperature: agent.model_config.temperature == null ? "" : String(agent.model_config.temperature),
+  temperature:
+    agent.model_config.temperature == null
+      ? ""
+      : String(agent.model_config.temperature),
   toolIds: joinIds(agent.tool_ids),
   skillIds: joinIds(agent.skill_ids),
   knowledgeIds: joinIds(agent.knowledge_ids),
@@ -329,16 +351,28 @@ const getNodeStyle = (kind: FlowStudioNodeKind) => ({
 
 const backendFlowToRecord = (flow: BackendFlow): FlowRecord => {
   const resources = flow.definition.nodes
-    .filter((node): node is Extract<BackendFlowNode, { type: "agent" | "team" }> => node.type === "agent" || node.type === "team")
+    .filter(
+      (node): node is Extract<BackendFlowNode, { type: "agent" | "team" }> =>
+        node.type === "agent" || node.type === "team",
+    )
     .map((node) => node.data.label);
-  const types = Array.from(new Set(flow.definition.nodes.map((node) => node.type)));
-  const inferredFlowType = flow.flow_type ?? (types.includes("team") || flow.definition.nodes.filter((node) => node.type === "agent").length > 1 ? "team" : "agent");
+  const types = Array.from(
+    new Set(flow.definition.nodes.map((node) => node.type)),
+  );
+  const inferredFlowType =
+    flow.flow_type ??
+    (types.includes("team") ||
+    flow.definition.nodes.filter((node) => node.type === "agent").length > 1
+      ? "team"
+      : "agent");
 
   return {
     id: flow.id,
     name: flow.name,
     flowType: inferredFlowType,
     status: flow.status === "published" ? "published" : "draft",
+    isExposed: flow.is_exposed,
+    isPrimary: flow.is_primary,
     latestVersion: flow.latest_version,
     updatedAt: formatBackendTime(flow.updated_at ?? flow.created_at),
     resources,
@@ -348,7 +382,9 @@ const backendFlowToRecord = (flow: BackendFlow): FlowRecord => {
   };
 };
 
-const backendNodeToStudioNode = (node: BackendFlowNode): Node<StudioNodeData> => {
+const backendNodeToStudioNode = (
+  node: BackendFlowNode,
+): Node<StudioNodeData> => {
   if (node.type === "agent") {
     return {
       id: node.id,
@@ -379,6 +415,7 @@ const backendNodeToStudioNode = (node: BackendFlowNode): Node<StudioNodeData> =>
         teamDescription: node.data.description ?? "",
         teamStrategy: node.data.strategy,
         memberAgentIds: node.data.member_agent_ids,
+        memberCount: node.data.member_agent_ids.length,
         maxRetry: node.data.max_retry ?? 0,
         onFail: node.data.on_fail ?? "",
       },
@@ -400,13 +437,17 @@ const backendNodeToStudioNode = (node: BackendFlowNode): Node<StudioNodeData> =>
     id: node.id,
     type: "studio",
     position: node.position,
-    data: { kind: node.type, label: node.data.label ?? (node.type === "start" ? "Start" : "End") },
+    data: {
+      kind: node.type,
+      label: node.data.label ?? (node.type === "start" ? "Start" : "End"),
+    },
     style: getNodeStyle(node.type),
   };
 };
 
-const createNodesFromDefinition = (definition: BackendFlowDefinition): StudioFlowNode[] =>
-  definition.nodes.map(backendNodeToStudioNode);
+const createNodesFromDefinition = (
+  definition: BackendFlowDefinition,
+): StudioFlowNode[] => definition.nodes.map(backendNodeToStudioNode);
 
 const createEdgesFromDefinition = (definition: BackendFlowDefinition): Edge[] =>
   definition.edges.map((edge) => ({
@@ -417,10 +458,14 @@ const createEdgesFromDefinition = (definition: BackendFlowDefinition): Edge[] =>
     targetHandle: edge.target_handle ?? undefined,
     data: edge.data,
     animated: edge.data?.branch === "failure",
-    className: edge.data?.branch === "failure" ? "flow-edge-failure" : undefined,
+    className:
+      edge.data?.branch === "failure" ? "flow-edge-failure" : undefined,
   }));
 
-const nodesToBackendDefinition = (nodes: Node<StudioNodeData>[], edges: Edge[]): BackendFlowDefinition => ({
+const nodesToBackendDefinition = (
+  nodes: Node<StudioNodeData>[],
+  edges: Edge[],
+): BackendFlowDefinition => ({
   nodes: nodes.map((node): BackendFlowNode => {
     if (node.data.kind === "agent") {
       return {
@@ -464,7 +509,11 @@ const nodesToBackendDefinition = (nodes: Node<StudioNodeData>[], edges: Edge[]):
         position: node.position,
         data: {
           label: node.data.label,
-          condition: { field: "input.user_message", operator: "contains", value: node.data.label },
+          condition: {
+            field: "input.user_message",
+            operator: "contains",
+            value: node.data.label,
+          },
         },
       };
     }
@@ -510,30 +559,6 @@ const mcpSections = [
   { title: "目标", value: "先把接入点做稳，再补生态兼容" },
 ];
 
-const stringifyRunOutput = (value: unknown) => {
-  if (value == null) {
-    return "";
-  }
-
-  if (typeof value === "string") {
-    return value;
-  }
-
-  if (typeof value === "object" && "result" in value && typeof value.result === "string") {
-    return value.result;
-  }
-
-  if (typeof value === "object" && "final_text" in value && typeof value.final_text === "string") {
-    return value.final_text;
-  }
-
-  if (typeof value === "object" && "message" in value && typeof value.message === "string") {
-    return value.message;
-  }
-
-  return JSON.stringify(value, null, 2);
-};
-
 function AppGlyph({ icon }: { icon: DesktopApp["icon"] }) {
   if (icon === "grid") {
     return (
@@ -574,15 +599,24 @@ function AppGlyph({ icon }: { icon: DesktopApp["icon"] }) {
   return <div className="glyph-rocket">✦</div>;
 }
 
-function StudioNodeCard(props: NodeProps<StudioFlowNode> & {
-  onAddNodeClick: (nodeId: string, screenPosition: { x: number; y: number }) => void;
-  onDeleteNodeClick: (nodeId: string) => void;
-}) {
+function StudioNodeCard(
+  props: NodeProps<StudioFlowNode> & {
+    onAddNodeClick: (
+      nodeId: string,
+      screenPosition: { x: number; y: number },
+    ) => void;
+    onDeleteNodeClick: (nodeId: string) => void;
+    onToggleTeamMembers: (nodeId: string) => void;
+    isTeamExpanded: boolean;
+    teamMemberNameMap: Record<string, string>;
+  },
+) {
   const { id, data, selected, onAddNodeClick, onDeleteNodeClick } = props;
   const config = getFlowStudioNodeConfig(data.kind);
-  const canConnectIn = data.kind !== "start";
-  const canAddNext = data.kind !== "end";
-  const canDelete = data.kind !== "start";
+  const isVirtualMember = Boolean(data.isVirtualMember);
+  const canConnectIn = data.kind !== "start" && !isVirtualMember;
+  const canAddNext = data.kind !== "end" && !isVirtualMember;
+  const canDelete = data.kind !== "start" && !isVirtualMember;
 
   const openNodeSelector = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
@@ -595,16 +629,22 @@ function StudioNodeCard(props: NodeProps<StudioFlowNode> & {
 
   const hint =
     data.kind === "start"
-      ? "添加后续节点"
-      : data.kind === "condition"
-        ? "配置条件"
-        : data.kind === "end"
-          ? "结束节点"
-          : "配置节点";
+      ? "流程起点"
+      : isVirtualMember
+        ? "Team 成员"
+        : data.kind === "condition"
+          ? "条件判断"
+          : data.kind === "end"
+            ? "流程结束"
+            : data.kind === "team"
+              ? "执行 Team"
+              : "执行 Agent";
 
   return (
     <>
-      <div className={`studio-node-card studio-node-${data.kind} ${selected ? "is-selected" : ""}`}>
+      <div
+        className={`studio-node-card studio-node-${data.kind} ${selected ? "is-selected" : ""}`}
+      >
         {canConnectIn ? (
           <Handle
             type="target"
@@ -625,7 +665,30 @@ function StudioNodeCard(props: NodeProps<StudioFlowNode> & {
 
         <div className="studio-node-body">{hint}</div>
 
-        <div className="studio-node-actions" onMouseDown={(event) => event.stopPropagation()}>
+        {data.kind === "team" && !isVirtualMember ? (
+          <div className="studio-node-body studio-node-team-body">
+            <button
+              type="button"
+              className="agent-link-button"
+              onClick={(event) => {
+                event.stopPropagation();
+                props.onToggleTeamMembers(id);
+              }}
+            >
+              {props.isTeamExpanded ? "关闭 Team 子图" : "查看 Team 子图"}
+            </button>
+            <div className="studio-team-members">
+              <span className="studio-team-member">
+                {(data.memberAgentIds ?? []).length} 个成员
+              </span>
+            </div>
+          </div>
+        ) : null}
+
+        <div
+          className="studio-node-actions"
+          onMouseDown={(event) => event.stopPropagation()}
+        >
           {canAddNext ? (
             <button
               type="button"
@@ -678,13 +741,19 @@ function FlowNodeSelector(props: {
     }
 
     const close = (event: MouseEvent) => {
-      if (event.target instanceof Element && event.target.closest(".flow-node-selector")) {
+      if (
+        event.target instanceof Element &&
+        event.target.closest(".flow-node-selector")
+      ) {
         return;
       }
       props.onClose();
     };
 
-    const timer = window.setTimeout(() => document.addEventListener("mousedown", close), 80);
+    const timer = window.setTimeout(
+      () => document.addEventListener("mousedown", close),
+      80,
+    );
     return () => {
       window.clearTimeout(timer);
       document.removeEventListener("mousedown", close);
@@ -696,10 +765,14 @@ function FlowNodeSelector(props: {
   }
 
   const normalizedSearch = searchText.trim().toLowerCase();
-  const selectableNodes = flowStudioNodeConfigs.filter((item) => item.kind !== "start");
+  const selectableNodes = flowStudioNodeConfigs.filter(
+    (item) => item.kind !== "start",
+  );
   const filteredNodes = normalizedSearch
     ? selectableNodes.filter((item) =>
-        `${item.label} ${item.description}`.toLowerCase().includes(normalizedSearch),
+        `${item.label} ${item.description}`
+          .toLowerCase()
+          .includes(normalizedSearch),
       )
     : selectableNodes;
 
@@ -727,9 +800,13 @@ function FlowNodeSelector(props: {
           <button
             key={nodeType.kind}
             type="button"
-            onClick={() => props.onSelect(nodeType.kind, props.anchor!.sourceNodeId)}
+            onClick={() =>
+              props.onSelect(nodeType.kind, props.anchor!.sourceNodeId)
+            }
           >
-            <span style={{ background: nodeType.color }}>{nodeType.label.slice(0, 1)}</span>
+            <span style={{ background: nodeType.color }}>
+              {nodeType.label.slice(0, 1)}
+            </span>
             <strong>{nodeType.label}</strong>
             <em>{nodeType.description}</em>
           </button>
@@ -747,8 +824,14 @@ function FlowCanvas(props: {
   onConnect: (connection: Connection) => void;
   onNodeClick: (_: React.MouseEvent, node: StudioFlowNode) => void;
   onPaneClick: () => void;
-  onAddNodeClick: (nodeId: string, screenPosition: { x: number; y: number }) => void;
+  onAddNodeClick: (
+    nodeId: string,
+    screenPosition: { x: number; y: number },
+  ) => void;
   onDeleteNodeClick: (nodeId: string) => void;
+  expandedTeamNodeIds: string[];
+  onToggleTeamMembers: (nodeId: string) => void;
+  teamMemberNameMap: Record<string, string>;
   focusNodeId?: string | null;
   centerSignal?: number;
 }) {
@@ -767,10 +850,19 @@ function FlowCanvas(props: {
           {...nodeProps}
           onAddNodeClick={props.onAddNodeClick}
           onDeleteNodeClick={props.onDeleteNodeClick}
+          onToggleTeamMembers={props.onToggleTeamMembers}
+          isTeamExpanded={props.expandedTeamNodeIds.includes(nodeProps.id)}
+          teamMemberNameMap={props.teamMemberNameMap}
         />
       ),
     }),
-    [props.onAddNodeClick, props.onDeleteNodeClick],
+    [
+      props.expandedTeamNodeIds,
+      props.onAddNodeClick,
+      props.onDeleteNodeClick,
+      props.onToggleTeamMembers,
+      props.teamMemberNameMap,
+    ],
   );
 
   useEffect(() => {
@@ -778,7 +870,9 @@ function FlowCanvas(props: {
       return;
     }
 
-    const targetNode = props.nodes.find((node) => node.id === props.focusNodeId);
+    const targetNode = props.nodes.find(
+      (node) => node.id === props.focusNodeId,
+    );
 
     if (!targetNode) {
       return;
@@ -821,7 +915,11 @@ function FlowCanvas(props: {
     >
       <Background gap={20} size={1} />
       <Controls>
-        <ControlButton onClick={centerCanvas} title="回到中央" aria-label="回到中央">
+        <ControlButton
+          onClick={centerCanvas}
+          title="回到中央"
+          aria-label="回到中央"
+        >
           ⌖
         </ControlButton>
       </Controls>
@@ -829,345 +927,291 @@ function FlowCanvas(props: {
   );
 }
 
-function RunConsole(props: {
+function TeamPreviewModal(props: {
+  definition: BackendFlowDefinition | null;
   title: string;
-  isRunning: boolean;
-  events: BackendRunStreamEvent[];
-  result: BackendRunDetail | null;
-  showResult?: boolean;
+  description?: string | null;
+  onClose: () => void;
 }) {
-  const lastEvent = props.events.at(-1);
+  const previewNodes = useMemo(
+    () => (props.definition ? createNodesFromDefinition(props.definition) : []),
+    [props.definition],
+  );
+  const previewEdges = useMemo(
+    () =>
+      props.definition
+        ? createEdgesFromDefinition(props.definition).filter(
+            (edge) => edge.data?.branch !== "failure",
+          )
+        : [],
+    [props.definition],
+  );
+
+  if (!props.definition) {
+    return null;
+  }
 
   return (
-    <div className="run-console">
-      <div className="run-console-header">
-        <div>
-          <strong>{props.title}</strong>
-          <span>{props.isRunning ? "Streaming..." : lastEvent ? lastEvent.event : "等待运行"}</span>
+    <div
+      className="team-preview-overlay"
+      role="dialog"
+      aria-modal="true"
+      onClick={props.onClose}
+    >
+      <div
+        className="team-preview-panel"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="flow-modal-header">
+          <div className="team-preview-heading">
+            <strong>{props.title}</strong>
+            <span>
+              {props.description || "这是当前 Team 的内部子编排视图。"}
+            </span>
+          </div>
+          <button
+            type="button"
+            className="agent-link-button"
+            onClick={props.onClose}
+          >
+            关闭
+          </button>
         </div>
-        <div className={`run-console-light ${props.isRunning ? "is-running" : ""}`} />
-      </div>
-
-      <div className="run-console-feed">
-        {props.events.length === 0 ? (
-          <p>点击运行后，这里会显示 run / step / tool / token 等事件流。</p>
-        ) : (
-          props.events.map((item, index) => (
-            <div key={`${item.event}_${index}`} className="run-console-event">
-              <span>{item.event}</span>
-              <pre>{formatRunEventSummary(item)}</pre>
-            </div>
-          ))
-        )}
-      </div>
-
-      {props.showResult !== false && props.result ? (
-        <div className="run-console-result">
-          <span>Final Output</span>
-          <pre>{JSON.stringify(props.result.output, null, 2)}</pre>
+        <div className="team-preview-canvas">
+          <ReactFlow<StudioFlowNode, Edge>
+            nodes={previewNodes}
+            edges={previewEdges}
+            fitView
+            fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
+            onInit={(instance) => {
+              window.setTimeout(() => {
+                instance.fitView({ padding: 0.22, maxZoom: 1 });
+              }, 60);
+            }}
+            onPaneClick={props.onClose}
+            minZoom={0.4}
+            maxZoom={1.2}
+            nodesDraggable={false}
+            nodesConnectable={false}
+            elementsSelectable={false}
+            panOnDrag
+          >
+            <Background gap={20} size={1} />
+          </ReactFlow>
         </div>
-      ) : null}
+      </div>
     </div>
   );
 }
 
-function formatRunEventSummary(item: BackendRunStreamEvent) {
-  const data = item.data as Record<string, unknown>;
-  const output = data.output as Record<string, unknown> | undefined;
-
-  if (item.event === "run.started") {
-    return `status: ${String(data.status ?? "running")}\nrun: ${String(data.run_id ?? "-")}`;
-  }
-
-  if (item.event === "step.started") {
-    return `node: ${String(data.node_id ?? "-")}\nagent: ${String(data.agent_id ?? data.node_type ?? "-")}`;
-  }
-
-  if (item.event === "step.completed") {
-    const message = typeof output?.message === "string" ? output.message : "step completed";
-    return trimConsoleText(message);
-  }
-
-  if (item.event === "run.completed") {
-    const finalOutput = data.output as Record<string, unknown> | undefined;
-    const finalText = typeof finalOutput?.final_text === "string" ? finalOutput.final_text : String(data.status ?? "completed");
-    return trimConsoleText(finalText);
-  }
-
-  if (item.event === "step.failed" || item.event === "run.failed") {
-    return trimConsoleText(String(data.error ?? "failed"));
-  }
-
-  return trimConsoleText(JSON.stringify(item.data, null, 2));
-}
-
-function trimConsoleText(value: string) {
-  return value.length > 220 ? `${value.slice(0, 220)}...` : value;
-}
-
-type HomeChatMessage = {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-};
-
-const DEFAULT_HOME_PROMPT = "你可以帮我干啥";
-
-function HomeFlowConsole() {
+function StudioWorkspace({
+  onRunFlow,
+  onBackToAssets,
+}: {
+  onRunFlow: (flowId: string) => void;
+  onBackToAssets: () => void;
+}) {
   const [flows, setFlows] = useState<BackendFlowSummary[]>([]);
   const [selectedFlowId, setSelectedFlowId] = useState("");
-  const [prompt, setPrompt] = useState(DEFAULT_HOME_PROMPT);
-  const [messages, setMessages] = useState<HomeChatMessage[]>([]);
-  const [events, setEvents] = useState<BackendRunStreamEvent[]>([]);
-  const [result, setResult] = useState<BackendRunDetail | null>(null);
-  const [isRunning, setIsRunning] = useState(false);
+  const [previewFlow, setPreviewFlow] = useState<BackendFlow | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
-  const chatStreamRef = useRef<HTMLDivElement | null>(null);
-  const shouldAutoScrollRef = useRef(true);
-
-  const scrollChatToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
-    const stream = chatStreamRef.current;
-    if (!stream) {
-      return;
-    }
-
-    stream.scrollTo({
-      top: stream.scrollHeight,
-      behavior,
-    });
-  }, []);
-
-  const handleChatScroll = useCallback(() => {
-    const stream = chatStreamRef.current;
-    if (!stream) {
-      return;
-    }
-
-    const distanceToBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight;
-    shouldAutoScrollRef.current = distanceToBottom < 48;
-  }, []);
-
-  useEffect(() => {
-    if (!shouldAutoScrollRef.current) {
-      return;
-    }
-
-    scrollChatToBottom(isRunning ? "auto" : "smooth");
-  }, [messages, isRunning, scrollChatToBottom]);
 
   useEffect(() => {
     let mounted = true;
 
-    async function loadFlows() {
+    async function loadStudioFlows() {
+      setIsLoading(true);
+      setError("");
+
       try {
-        const backendFlows = await listBackendFlows();
+        const exposedFlows = (await listBackendFlows()).filter(
+          (flow) => flow.is_exposed,
+        );
+        const primaryFlow = exposedFlows.find((flow) => flow.is_primary);
 
         if (!mounted) {
           return;
         }
 
-        setFlows(backendFlows);
-        setSelectedFlowId((current) => current || backendFlows[0]?.id || "");
+        setFlows(exposedFlows);
+        setSelectedFlowId(primaryFlow?.id || exposedFlows[0]?.id || "");
       } catch (loadError) {
         if (mounted) {
-          setError(loadError instanceof Error ? loadError.message : "读取 Flow 失败");
+          setError(
+            loadError instanceof Error
+              ? loadError.message
+              : "读取 Studio 数字人失败",
+          );
+          setFlows([]);
+          setSelectedFlowId("");
+        }
+      } finally {
+        if (mounted) {
+          setIsLoading(false);
         }
       }
     }
 
-    void loadFlows();
+    void loadStudioFlows();
 
     return () => {
       mounted = false;
     };
   }, []);
 
-  const selectedFlow = flows.find((flow) => flow.id === selectedFlowId) ?? flows[0];
+  const selectedFlow =
+    flows.find((flow) => flow.id === selectedFlowId) ?? flows[0] ?? null;
 
-  const runSelectedFlow = async () => {
-    if (!selectedFlow || !prompt.trim() || isRunning) {
-      return;
-    }
-
-    const userText = prompt.trim();
-    const history = messages;
-    const assistantMessageId = `assistant_${Date.now()}`;
-    setEvents([]);
-    setResult(null);
-    setError("");
-    setIsRunning(true);
-    setPrompt("");
-    shouldAutoScrollRef.current = true;
-    setMessages((current) => [
-      ...current,
-      { id: `user_${Date.now()}`, role: "user", content: userText },
-      { id: assistantMessageId, role: "assistant", content: "" },
-    ]);
-    requestAnimationFrame(() => scrollChatToBottom("smooth"));
-
+  const openFlowPreview = useCallback(async (flowId: string) => {
     try {
-      let streamedResult: BackendRunDetail | null = null;
-
-      await streamBackendFlowRun(selectedFlow.id, {
-        user_message: userText,
-        messages: history.map((item) => ({ role: item.role, content: item.content })),
-        session_id: "home",
-      }, (event) => {
-        if (event.event === "token.delta") {
-          const delta = typeof event.data.delta === "string" ? event.data.delta : "";
-          if (delta) {
-            setMessages((current) =>
-              current.map((item) =>
-                item.id === assistantMessageId ? { ...item, content: item.content + delta } : item,
-              ),
-            );
-          }
-          return;
-        }
-
-        if (event.event === "team.placeholder.completed") {
-          const output = event.data.output as { message?: unknown } | undefined;
-          const message = typeof output?.message === "string" ? output.message : "";
-          if (message) {
-            setMessages((current) =>
-              current.map((item) =>
-                item.id === assistantMessageId && !item.content ? { ...item, content: message } : item,
-              ),
-            );
-          }
-        }
-
-        setEvents((current) => [...current, event]);
-
-        if (event.event === "run.completed") {
-          streamedResult = event.data as unknown as BackendRunDetail;
-        }
-      });
-
-      const finalResult = streamedResult ?? (await runBackendFlow(selectedFlow.id, {
-        user_message: userText,
-        messages: history.map((item) => ({ role: item.role, content: item.content })),
-        session_id: "home",
-      }));
-      setResult(finalResult);
-      const finalText = stringifyRunOutput(finalResult.output);
-      if (finalText) {
-        setMessages((current) =>
-          current.map((item) =>
-            item.id === assistantMessageId && !item.content ? { ...item, content: finalText } : item,
-          ),
-        );
-      }
-    } catch (runError) {
-      setError(runError instanceof Error ? runError.message : "运行 Flow 失败");
-      setMessages((current) =>
-        current.map((item) =>
-          item.id === assistantMessageId && !item.content
-            ? { ...item, content: "运行失败，请查看右侧事件流或后端日志。" }
-            : item,
-        ),
+      const detail = await getBackendFlow(flowId);
+      setPreviewFlow(detail);
+    } catch (previewError) {
+      setError(
+        previewError instanceof Error ? previewError.message : "读取结构失败",
       );
-    } finally {
-      setIsRunning(false);
     }
-  };
+  }, []);
 
   return (
-    <section className="home-console">
-      <div className="home-console-head">
-        <div className="home-console-title">
-          <span>Agent Console</span>
-          <h1>{selectedFlow?.name ?? "选择一个 Flow"}</h1>
-          <p>{isRunning ? "正在流式执行..." : "输入任务，交给当前编排好的 Agent 工作流处理。"}</p>
-        </div>
-        <div className="home-flow-actions">
-          <label className="home-flow-picker">
-            <span>Flow</span>
-            <select
-              value={selectedFlow?.id ?? ""}
-              disabled={flows.length === 0 || isRunning}
-              onChange={(event) => setSelectedFlowId(event.target.value)}
-            >
-              {flows.length === 0 ? <option value="">暂无 Flow</option> : null}
-              {flows.map((flow) => (
-                <option key={flow.id} value={flow.id}>
-                  {flow.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <button
-            type="button"
-            className="flow-secondary-button"
-            disabled={isRunning || messages.length === 0}
-            onClick={() => {
-              setMessages([]);
-              setEvents([]);
-              setResult(null);
-              setError("");
-            }}
-          >
-            清空对话
-          </button>
-        </div>
-      </div>
-
-      <div className="home-console-grid">
-        <div className="home-chat-panel">
-          <div ref={chatStreamRef} className="home-chat-stream" onScroll={handleChatScroll}>
-            {messages.length === 0 ? (
-              <div className="home-message is-agent">
-                <span>{selectedFlow?.name ?? "Flow Agent"}</span>
-                <p>输入一个任务，我会以流式方式运行编排，并在本页面保留短期上下文。</p>
-              </div>
-            ) : null}
-            {messages.map((message) => (
-              <div key={message.id} className={`home-message ${message.role === "user" ? "is-user" : "is-agent"}`}>
-                <span>{message.role === "user" ? "你" : selectedFlow?.name ?? "Flow Agent"}</span>
-                {message.content ? <div className="home-message-content">{message.content}</div> : <p>正在生成...</p>}
-              </div>
-            ))}
-            {error ? <p className="home-error">{error}</p> : null}
+    <section className="workspace-canvas workspace-canvas-plain">
+      <div className="content-doc content-doc-flow flow-list-page">
+        <header className="flow-page-header">
+          <div>
+            <h2>Studio 工作台</h2>
+            <p>
+              这里只展示已经对外暴露的最终数字人，用于运行、预览结构和确认主入口状态。
+            </p>
           </div>
-
-          <form
-            className="home-composer"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void runSelectedFlow();
-            }}
-          >
-            <input
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              placeholder="输入任务，按 Enter 发送"
-            />
+          <div className="flow-header-actions">
             <button
-              type="submit"
-              className="flow-primary-button"
-              disabled={!selectedFlow || !prompt.trim() || isRunning}
+              type="button"
+              className="flow-secondary-button"
+              onClick={onBackToAssets}
             >
-              {isRunning ? "运行中" : "发送"}
+              去我的数字人
             </button>
-          </form>
+            {selectedFlow ? (
+              <button
+                type="button"
+                className="flow-primary-button"
+                onClick={() => onRunFlow(selectedFlow.id)}
+              >
+                运行当前数字人
+              </button>
+            ) : null}
+          </div>
+        </header>
+
+        {error ? <div className="flow-inline-alert">{error}</div> : null}
+
+        <div className="agent-hub-layout studio-hub-layout">
+          <aside className="agent-sidebar">
+            <div className="agent-sidebar-title">
+              <strong>已暴露数字人</strong>
+            </div>
+            {isLoading ? (
+              <div className="empty-flow-card">
+                <strong>正在加载</strong>
+                <p>读取对外数字人列表。</p>
+              </div>
+            ) : flows.length === 0 ? (
+              <div className="empty-flow-card">
+                <strong>暂无对外数字人</strong>
+                <p>请先在“我的数字人”里把最终 Flow 设为对外暴露。</p>
+              </div>
+            ) : (
+              flows.map((flow) => (
+                <button
+                  key={flow.id}
+                  type="button"
+                  className={selectedFlow?.id === flow.id ? "is-active" : ""}
+                  onClick={() => setSelectedFlowId(flow.id)}
+                >
+                  <span>{flow.name}</span>
+                  <small>
+                    {flow.is_primary ? "主入口" : `v${flow.latest_version}`}
+                  </small>
+                </button>
+              ))
+            )}
+          </aside>
+
+          <div className="flow-list-card agent-hub-list studio-hub-list">
+            {!selectedFlow ? (
+              <div className="empty-flow-card">
+                <strong>请选择一个数字人</strong>
+                <p>Studio 工作台只面向对外数字人，不会直接进入内部编排编辑。</p>
+              </div>
+            ) : (
+              <article className="agent-row agent-hub-row is-selected">
+                <div className="agent-row-main">
+                  <span className="agent-status agent-status-team" />
+                  <div>
+                    <strong>{selectedFlow.name}</strong>
+                    <p>
+                      {selectedFlow.description ||
+                        "这个数字人已经对外暴露，可用于运行和结构预览。"}
+                    </p>
+                  </div>
+                </div>
+                <div className="agent-row-meta">
+                  <span>Flow</span>
+                  <span>{selectedFlow.status}</span>
+                  <span>已暴露</span>
+                  <span>v{selectedFlow.latest_version}</span>
+                  {selectedFlow.is_primary ? <span>主入口</span> : null}
+                </div>
+                <div className="agent-row-actions">
+                  <button
+                    type="button"
+                    className="agent-link-button"
+                    onClick={() => onRunFlow(selectedFlow.id)}
+                  >
+                    运行
+                  </button>
+                  <button
+                    type="button"
+                    className="agent-link-button"
+                    onClick={() => void openFlowPreview(selectedFlow.id)}
+                  >
+                    查看结构
+                  </button>
+                  <button
+                    type="button"
+                    className="agent-link-button"
+                    onClick={onBackToAssets}
+                  >
+                    去我的数字人编辑
+                  </button>
+                </div>
+              </article>
+            )}
+          </div>
         </div>
 
-        <RunConsole title="Run Timeline" isRunning={isRunning} events={events} result={result} showResult={false} />
+        <TeamPreviewModal
+          definition={previewFlow?.definition ?? null}
+          title={
+            previewFlow ? `${previewFlow.name} · 数字人结构` : "数字人结构"
+          }
+          description={
+            previewFlow?.description ||
+            "这里只做结构预览，不在 Studio 工作台里直接编辑。"
+          }
+          onClose={() => setPreviewFlow(null)}
+        />
       </div>
     </section>
   );
 }
 
-function FlowStudioContent() {
+function FlowStudioContent({ onBackToAssets }: { onBackToAssets: () => void }) {
   const [flows, setFlows] = useState<FlowRecord[]>([]);
-  const [selectedFlowId, setSelectedFlowId] = useState<string>(() => readQueryParam("flow") ?? "");
-  const [flowView, setFlowView] = useState<"list" | "editor">(() =>
-    readQueryParam("view") === "editor" ? "editor" : "list",
+  const [selectedFlowId, setSelectedFlowId] = useState<string>(
+    () => readQueryParam("flow") ?? "",
   );
-  const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
-  const [newFlowName, setNewFlowName] = useState("");
-  const [newFlowDescription, setNewFlowDescription] = useState("");
-  const [newFlowType, setNewFlowType] = useState<"agent" | "team">("agent");
   const [backendAgents, setBackendAgents] = useState<BackendAgent[]>([]);
   const [backendTeams, setBackendTeams] = useState<BackendTeam[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
@@ -1182,29 +1226,83 @@ function FlowStudioContent() {
   const [runEvents, setRunEvents] = useState<BackendRunStreamEvent[]>([]);
   const [isRunStreaming, setIsRunStreaming] = useState(false);
   const [runInputText] = useState('{"user_message":"帮我处理这个问题"}');
-  const [nodeSelectorAnchor, setNodeSelectorAnchor] = useState<{ sourceNodeId: string; x: number; y: number } | null>(null);
-  const [selectedAgentDetail, setSelectedAgentDetail] = useState<BackendAgentDetail | null>(null);
+  const [nodeSelectorAnchor, setNodeSelectorAnchor] = useState<{
+    sourceNodeId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [selectedAgentDetail, setSelectedAgentDetail] =
+    useState<BackendAgentDetail | null>(null);
+  const [homeConsoleConfigMap, setHomeConsoleConfigMap] = useState<Record<string, HomeConsoleConfig>>(() => readHomeConsoleConfigMap());
   const [isAgentSaving, setIsAgentSaving] = useState(false);
-  const agentForm = useMemo(() => createForm({ initialValues: emptyAgentDraft }), []);
+  const [previewTeamNodeId, setPreviewTeamNodeId] = useState<string | null>(
+    null,
+  );
+  const agentForm = useMemo(
+    () => createForm({ initialValues: emptyAgentDraft }),
+    [],
+  );
 
-  const selectedFlow = flows.find((flow) => flow.id === selectedFlowId) ?? flows[0];
+  const selectedFlow =
+    flows.find((flow) => flow.id === selectedFlowId) ?? flows[0];
   const agentOptions = backendAgents;
   const teamOptions = backendTeams;
-  const updateSelectedFlow = (patch: Partial<Pick<FlowRecord, "name" | "description" | "flowType">>) => {
+  const selectedFlowHomeConfig = useMemo(() => selectedFlow ? homeConsoleConfigMap[selectedFlow.id] ?? {} : {}, [homeConsoleConfigMap, selectedFlow]);
+  const teamMemberNameMap = useMemo(
+    () =>
+      Object.fromEntries(backendAgents.map((agent) => [agent.id, agent.name])),
+    [backendAgents],
+  );
+  const updateSelectedFlowHomeConfig = (patch: Partial<HomeConsoleConfig>) => {
     if (!selectedFlow) {
       return;
     }
 
-    setFlows((current) => current.map((flow) => (flow.id === selectedFlow.id ? { ...flow, ...patch } : flow)));
+    setHomeConsoleConfigMap((current) => {
+      const next = {
+        ...current,
+        [selectedFlow.id]: {
+          ...current[selectedFlow.id],
+          ...patch,
+        },
+      };
+      writeHomeConsoleConfigMap(next);
+      return next;
+    });
   };
-  const [nodes, setNodes, onNodesChange] = useNodesState<StudioFlowNode>(selectedFlow ? createNodesFromDefinition(selectedFlow.definition) : []);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(selectedFlow ? createEdgesFromDefinition(selectedFlow.definition) : []);
+
+  const updateSelectedFlow = (
+    patch: Partial<Pick<FlowRecord, "name" | "description" | "flowType">>,
+  ) => {
+    if (!selectedFlow) {
+      return;
+    }
+
+    setFlows((current) =>
+      current.map((flow) =>
+        flow.id === selectedFlow.id ? { ...flow, ...patch } : flow,
+      ),
+    );
+  };
+  const [nodes, setNodes, onNodesChange] = useNodesState<StudioFlowNode>(
+    selectedFlow ? createNodesFromDefinition(selectedFlow.definition) : [],
+  );
+  const [edges, setEdges, onEdgesChange] = useEdgesState(
+    selectedFlow ? createEdgesFromDefinition(selectedFlow.definition) : [],
+  );
+  const toggleTeamMembers = useCallback((nodeId: string) => {
+    setPreviewTeamNodeId((current) => (current === nodeId ? null : nodeId));
+  }, []);
 
   useEffect(() => {
     const centerOnNormalWindow = () => setCenterSignal((value) => value + 1);
 
     window.addEventListener("agent-studio:center-flow", centerOnNormalWindow);
-    return () => window.removeEventListener("agent-studio:center-flow", centerOnNormalWindow);
+    return () =>
+      window.removeEventListener(
+        "agent-studio:center-flow",
+        centerOnNormalWindow,
+      );
   }, []);
 
   useEffect(() => {
@@ -1215,18 +1313,26 @@ function FlowStudioContent() {
       setFlowError("");
 
       try {
-        const [backendFlows, agents, teams] = await Promise.all([listBackendFlows(), listBackendAgents(), listBackendTeams()]);
+        const [backendFlows, agents, teams] = await Promise.all([
+          listBackendFlows(),
+          listBackendAgents(),
+          listBackendTeams(),
+        ]);
 
         if (!mounted) {
           return;
         }
 
-        const backendFlowDetails = await Promise.all(backendFlows.map((flow) => getBackendFlow(flow.id)));
+        const backendFlowDetails = await Promise.all(
+          backendFlows.map((flow) => getBackendFlow(flow.id)),
+        );
         const records = backendFlowDetails.map(backendFlowToRecord);
         const routeFlowId = readQueryParam("flow");
-        const routeFlow = routeFlowId ? records.find((flow) => flow.id === routeFlowId) : undefined;
+        const routeFlow = routeFlowId
+          ? records.find((flow) => flow.id === routeFlowId)
+          : undefined;
         setFlows(records);
-        setSelectedFlowId(routeFlow?.id ?? records[0]?.id ?? "");
+        setSelectedFlowId(routeFlow?.id ?? "");
         setBackendAgents(agents);
         setBackendTeams(teams);
       } catch (error) {
@@ -1237,7 +1343,11 @@ function FlowStudioContent() {
           setBackendTeams([]);
           setNodes([]);
           setEdges([]);
-          setFlowError(error instanceof Error ? error.message : "本地后端暂不可用，请确认 7000 端口服务已启动。");
+          setFlowError(
+            error instanceof Error
+              ? error.message
+              : "本地后端暂不可用，请确认 7100 端口服务已启动。",
+          );
         }
       } finally {
         if (mounted) {
@@ -1256,15 +1366,15 @@ function FlowStudioContent() {
   useEffect(() => {
     replaceRouteQuery({
       app: "flow",
-      view: flowView,
-      flow: flowView === "editor" ? selectedFlowId : null,
+      flow: selectedFlowId || null,
     });
-  }, [flowView, selectedFlowId]);
+  }, [selectedFlowId]);
 
   useEffect(() => {
     if (!selectedFlow) {
       setNodes([]);
       setEdges([]);
+      setPreviewTeamNodeId(null);
       setSelectedNodeId(null);
       setFocusNodeId(null);
       return;
@@ -1272,7 +1382,10 @@ function FlowStudioContent() {
 
     setNodes(createNodesFromDefinition(selectedFlow.definition));
     setEdges(createEdgesFromDefinition(selectedFlow.definition));
-    const initialAgentNode = selectedFlow.definition.nodes.find((node) => node.type === "agent")?.id ?? null;
+    setPreviewTeamNodeId(null);
+    const initialAgentNode =
+      selectedFlow.definition.nodes.find((node) => node.type === "agent")?.id ??
+      null;
     setSelectedNodeId(null);
     setIsFlowSettingsOpen(true);
     setFocusNodeId(initialAgentNode);
@@ -1290,7 +1403,40 @@ function FlowStudioContent() {
   }, [canvasNotice]);
 
   const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? null;
-  const selectedAgentId = selectedNode?.data.kind === "agent" ? selectedNode.data.agentId : undefined;
+  const visibleEdges = useMemo(
+    () =>
+      edges.map((edge) => ({
+        ...edge,
+        hidden:
+          edge.data?.branch === "failure"
+            ? !(
+                selectedNodeId &&
+                (edge.source === selectedNodeId ||
+                  edge.target === selectedNodeId)
+              )
+            : false,
+      })),
+    [edges, selectedNodeId],
+  );
+  const selectedAgentId =
+    selectedNode?.data.kind === "agent" ? selectedNode.data.agentId : undefined;
+  const previewTeamNode =
+    nodes.find(
+      (node) => node.id === previewTeamNodeId && node.data.kind === "team",
+    ) ?? null;
+  const previewTeamRecord = previewTeamNode
+    ? (teamOptions.find((team) => team.id === previewTeamNode.data.teamId) ?? {
+        id: previewTeamNode.data.teamId ?? previewTeamNode.id,
+        name: previewTeamNode.data.label,
+        description: previewTeamNode.data.teamDescription ?? "",
+        strategy: previewTeamNode.data.teamStrategy ?? "parallel",
+        member_agent_ids: previewTeamNode.data.memberAgentIds ?? [],
+        status: "active",
+      })
+    : null;
+  const previewTeamDefinition = previewTeamRecord
+    ? createTeamWrapperDefinition(previewTeamRecord, backendAgents)
+    : null;
 
   useEffect(() => {
     let mounted = true;
@@ -1312,7 +1458,9 @@ function FlowStudioContent() {
         agentForm.setValues(agentDetailToDraft(detail), "overwrite");
       } catch (error) {
         if (mounted) {
-          setFlowError(error instanceof Error ? error.message : "读取 Agent 详情失败");
+          setFlowError(
+            error instanceof Error ? error.message : "读取 Agent 详情失败",
+          );
         }
       }
     }
@@ -1327,7 +1475,11 @@ function FlowStudioContent() {
   const onConnect = (connection: Connection) => {
     const sourceNode = nodes.find((node) => node.id === connection.source);
     const targetNode = nodes.find((node) => node.id === connection.target);
-    const isFailureBackflow = Boolean(sourceNode && targetNode && targetNode.position.x <= sourceNode.position.x);
+    const isFailureBackflow = Boolean(
+      sourceNode &&
+      targetNode &&
+      targetNode.position.x <= sourceNode.position.x,
+    );
 
     setEdges((current) =>
       addEdge(
@@ -1335,7 +1487,9 @@ function FlowStudioContent() {
           ...connection,
           animated: isFailureBackflow,
           className: isFailureBackflow ? "flow-edge-failure" : undefined,
-          data: isFailureBackflow ? { branch: "failure" } : { branch: "success" },
+          data: isFailureBackflow
+            ? { branch: "failure" }
+            : { branch: "success" },
         },
         current,
       ),
@@ -1368,9 +1522,16 @@ function FlowStudioContent() {
 
     const id = `${selectedFlow.id}_${kind}_${Date.now()}`;
     const config = getFlowStudioNodeConfig(kind);
-    const sourceNode = sourceNodeId ? nodes.find((node) => node.id === sourceNodeId) : null;
-    const siblingCount = sourceNodeId ? edges.filter((edge) => edge.source === sourceNodeId).length : 0;
-    const parallelOffset = siblingCount === 0 ? 0 : (siblingCount % 2 === 1 ? 1 : -1) * Math.ceil(siblingCount / 2) * 82;
+    const sourceNode = sourceNodeId
+      ? nodes.find((node) => node.id === sourceNodeId)
+      : null;
+    const siblingCount = sourceNodeId
+      ? edges.filter((edge) => edge.source === sourceNodeId).length
+      : 0;
+    const parallelOffset =
+      siblingCount === 0
+        ? 0
+        : (siblingCount % 2 === 1 ? 1 : -1) * Math.ceil(siblingCount / 2) * 82;
     let createdNode: Node<StudioNodeData> | null = null;
 
     setNodes((current) => {
@@ -1378,19 +1539,43 @@ function FlowStudioContent() {
         id,
         type: "studio",
         position: {
-          x: sourceNode ? sourceNode.position.x + 260 : 160 + (current.length % 4) * 210,
-          y: sourceNode ? sourceNode.position.y + parallelOffset : 120 + Math.floor(current.length / 4) * 120,
+          x: sourceNode
+            ? sourceNode.position.x + 260
+            : 160 + (current.length % 4) * 210,
+          y: sourceNode
+            ? sourceNode.position.y + parallelOffset
+            : 120 + Math.floor(current.length / 4) * 120,
         },
         data: {
           kind,
-          label: kind === "agent" ? agentOptions[0]?.name ?? "Agent Node" : kind === "team" ? teamOptions[0]?.name ?? "Agent Team" : config.label,
+          label:
+            kind === "agent"
+              ? (agentOptions[0]?.name ?? "Agent Node")
+              : kind === "team"
+                ? (teamOptions[0]?.name ?? "Agent Team")
+                : config.label,
           agentName: kind === "agent" ? agentOptions[0]?.name : undefined,
           agentId: kind === "agent" ? agentOptions[0]?.id : undefined,
           teamId: kind === "team" ? teamOptions[0]?.id : undefined,
           teamName: kind === "team" ? teamOptions[0]?.name : undefined,
-          teamDescription: kind === "team" ? teamOptions[0]?.description ?? "并列执行一组已有 Agent，适合处理 todo list 拆分后的同级任务。" : undefined,
-          teamStrategy: kind === "team" ? teamOptions[0]?.strategy ?? "parallel" : undefined,
-          memberAgentIds: kind === "team" ? teamOptions[0]?.member_agent_ids ?? agentOptions.slice(0, 2).map((agent) => agent.id) : undefined,
+          teamDescription:
+            kind === "team"
+              ? (teamOptions[0]?.description ??
+                "并列执行一组已有 Agent，适合处理 todo list 拆分后的同级任务。")
+              : undefined,
+          teamStrategy:
+            kind === "team"
+              ? (teamOptions[0]?.strategy ?? "parallel")
+              : undefined,
+          memberAgentIds:
+            kind === "team"
+              ? (teamOptions[0]?.member_agent_ids ??
+                agentOptions.slice(0, 2).map((agent) => agent.id))
+              : undefined,
+          memberCount:
+            kind === "team"
+              ? (teamOptions[0]?.member_agent_ids?.length ?? 0)
+              : undefined,
         },
         style: {
           background: config.color,
@@ -1417,7 +1602,11 @@ function FlowStudioContent() {
       );
     }
 
-    if (kind === "team" || (kind === "agent" && nodes.filter((node) => node.data.kind === "agent").length >= 1)) {
+    if (
+      kind === "team" ||
+      (kind === "agent" &&
+        nodes.filter((node) => node.data.kind === "agent").length >= 1)
+    ) {
       updateSelectedFlow({ flowType: "team" });
     }
 
@@ -1428,7 +1617,10 @@ function FlowStudioContent() {
     setCanvasNotice(`${config.label} 节点已添加`);
   };
 
-  const openNodeSelectorFromNode = (sourceNodeId: string, screenPosition: { x: number; y: number }) => {
+  const openNodeSelectorFromNode = (
+    sourceNodeId: string,
+    screenPosition: { x: number; y: number },
+  ) => {
     setSelectedNodeId(sourceNodeId);
     setIsFlowSettingsOpen(false);
     setNodeSelectorAnchor({ sourceNodeId, ...screenPosition });
@@ -1443,7 +1635,11 @@ function FlowStudioContent() {
     }
 
     setNodes((current) => current.filter((node) => node.id !== nodeId));
-    setEdges((current) => current.filter((edge) => edge.source !== nodeId && edge.target !== nodeId));
+    setEdges((current) =>
+      current.filter(
+        (edge) => edge.source !== nodeId && edge.target !== nodeId,
+      ),
+    );
     setCanvasNotice("已删除节点，请手动重新连接上下游");
 
     if (selectedNodeId === nodeId) {
@@ -1489,7 +1685,9 @@ function FlowStudioContent() {
       ...emptyAgentDraft,
       ...(agentForm.values as Partial<AgentDraft>),
     };
-    const parsedTemperature = agentDraft.temperature.trim() ? Number(agentDraft.temperature) : null;
+    const parsedTemperature = agentDraft.temperature.trim()
+      ? Number(agentDraft.temperature)
+      : null;
     if (parsedTemperature != null && Number.isNaN(parsedTemperature)) {
       setFlowError("temperature 需要是数字，例如 0.2");
       return;
@@ -1505,7 +1703,8 @@ function FlowStudioContent() {
         instructions: agentDraft.instructions.trim() || null,
         model_config: {
           ...selectedAgentDetail.model_config,
-          model: agentDraft.model.trim() || selectedAgentDetail.model_config.model,
+          model:
+            agentDraft.model.trim() || selectedAgentDetail.model_config.model,
           temperature: parsedTemperature,
         },
         tool_ids: splitIds(agentDraft.toolIds),
@@ -1517,7 +1716,11 @@ function FlowStudioContent() {
 
       setSelectedAgentDetail(updated);
       agentForm.setValues(agentDetailToDraft(updated), "overwrite");
-      setBackendAgents((current) => current.map((agent) => (agent.id === updated.id ? { ...agent, ...updated } : agent)));
+      setBackendAgents((current) =>
+        current.map((agent) =>
+          agent.id === updated.id ? { ...agent, ...updated } : agent,
+        ),
+      );
       updateSelectedNode({
         label: updated.name,
         agentName: updated.name,
@@ -1525,45 +1728,11 @@ function FlowStudioContent() {
       });
       setCanvasNotice("Agent 配置已保存");
     } catch (error) {
-      setFlowError(error instanceof Error ? error.message : "保存 Agent 配置失败");
+      setFlowError(
+        error instanceof Error ? error.message : "保存 Agent 配置失败",
+      );
     } finally {
       setIsAgentSaving(false);
-    }
-  };
-
-  const createFlow = async () => {
-    const normalizedName = newFlowName.trim();
-
-    if (!normalizedName) {
-      return;
-    }
-
-    setIsFlowLoading(true);
-    setFlowError("");
-
-    try {
-      const created = await createBackendFlow({
-        name: normalizedName,
-        description: newFlowDescription.trim() || "新的多 Agent 工作流，等待进入画布继续配置。",
-        flow_type: newFlowType,
-        owner_user_id: "local_user",
-        workspace_id: "local_workspace",
-        definition: nodesToBackendDefinition(nodes, edges),
-      });
-      const record = backendFlowToRecord(created);
-
-      setFlows((current) => [record, ...current.filter((flow) => flow.id !== record.id)]);
-      setSelectedFlowId(record.id);
-      setFlowView("editor");
-      setIsCreateModalOpen(false);
-      setNewFlowName("");
-      setNewFlowDescription("");
-      setNewFlowType("agent");
-      setCanvasNotice("Flow 已保存到本地后端");
-    } catch (error) {
-      setFlowError(error instanceof Error ? error.message : "后端保存失败，请确认 7000 端口服务已启动。");
-    } finally {
-      setIsFlowLoading(false);
     }
   };
 
@@ -1584,28 +1753,18 @@ function FlowStudioContent() {
       });
       const record = backendFlowToRecord(updated);
 
-      setFlows((current) => current.map((flow) => (flow.id === record.id ? record : flow)));
+      setFlows((current) =>
+        current.map((flow) => (flow.id === record.id ? record : flow)),
+      );
       setCanvasNotice(`Flow 已保存，版本 v${record.latestVersion}`);
     } catch (error) {
-      setFlowError(error instanceof Error ? error.message : "保存 Flow 失败，请确认后端 7000 正常运行。");
+      setFlowError(
+        error instanceof Error
+          ? error.message
+          : "保存 Flow 失败，请确认后端 7100 正常运行。",
+      );
     } finally {
       setIsFlowSaving(false);
-    }
-  };
-
-  const isCreateDisabled = !newFlowName.trim();
-
-  const openFlowEditor = async (flow: FlowRecord) => {
-    setSelectedFlowId(flow.id);
-    setFlowView("editor");
-    setFlowError("");
-
-    try {
-      const detail = await getBackendFlow(flow.id);
-      const record = backendFlowToRecord(detail);
-      setFlows((current) => current.map((item) => (item.id === record.id ? record : item)));
-    } catch (error) {
-      setFlowError(error instanceof Error ? error.message : "读取 Flow 详情失败");
     }
   };
 
@@ -1631,7 +1790,8 @@ function FlowStudioContent() {
         }
       });
 
-      const result = streamedResult ?? (await runBackendFlow(selectedFlow.id, input));
+      const result =
+        streamedResult ?? (await runBackendFlow(selectedFlow.id, input));
       setRunResult(result);
       setCanvasNotice(`运行完成：${result.status}`);
     } catch (error) {
@@ -1641,553 +1801,38 @@ function FlowStudioContent() {
     }
   };
 
-  if (flowView === "editor" && selectedFlow) {
+  if (!selectedFlow) {
     return (
       <section className="workspace-canvas workspace-canvas-plain">
-        <div className="content-doc content-doc-flow content-doc-flow-editor">
+        <div className="content-doc content-doc-flow flow-list-page">
           <header className="flow-page-header">
             <div>
-              <h2>{selectedFlow.name}</h2>
+              <h2>Studio</h2>
+              <p>
+                Studio 只负责编辑当前 Agent /
+                Team，请从“我的数字人”选择一个资产进入编排。
+              </p>
             </div>
-
             <div className="flow-header-actions">
-              <button type="button" className="flow-secondary-button" onClick={() => setFlowView("list")}>
-                返回 Flows
-              </button>
-              <button type="button" className="flow-secondary-button" onClick={deleteSelectedNode}>
-                删除节点
-              </button>
-              <button type="button" className="flow-secondary-button" onClick={() => setIsCreateModalOpen(true)}>
-                新建 Flow
-              </button>
-              <button type="button" className="flow-secondary-button" onClick={saveCurrentFlow} disabled={isFlowSaving}>
-                {isFlowSaving ? "保存中..." : "保存 Flow"}
-              </button>
-              <button type="button" className="flow-primary-button" onClick={runCurrentFlow}>
-                {isRunStreaming ? "运行中..." : "运行调试"}
+              <button
+                type="button"
+                className="flow-primary-button"
+                onClick={onBackToAssets}
+              >
+                返回我的数字人
               </button>
             </div>
           </header>
-
-          {flowError ? <div className="flow-inline-alert">{flowError}</div> : null}
-
-          <div className={`flow-editor-shell ${selectedNodeId || isFlowSettingsOpen ? 'has-panel-open' : ''}`}>
-            <section className="flow-editor-canvas">
-              {canvasNotice ? <div className="flow-canvas-notice">{canvasNotice}</div> : null}
-              <ReactFlowProvider>
-                <FlowCanvas
-                  nodes={nodes}
-                  edges={edges}
-                  onNodesChange={onNodesChange}
-                  onEdgesChange={onEdgesChange}
-                  onConnect={onConnect}
-                  onNodeClick={(_, node) => {
-                    setSelectedNodeId(node.id);
-                    setIsFlowSettingsOpen(false);
-                  }}
-                  onPaneClick={() => {
-                    setSelectedNodeId(null);
-                    setIsFlowSettingsOpen(true);
-                    setNodeSelectorAnchor(null);
-                  }}
-                  onAddNodeClick={openNodeSelectorFromNode}
-                  onDeleteNodeClick={deleteNodeById}
-                  focusNodeId={focusNodeId}
-                  centerSignal={centerSignal}
-                />
-              </ReactFlowProvider>
-              <FlowNodeSelector
-                anchor={nodeSelectorAnchor}
-                onClose={() => setNodeSelectorAnchor(null)}
-                onSelect={(kind, sourceNodeId) => addNode(kind, sourceNodeId)}
-              />
-            </section>
-
-            <aside className={`flow-editor-panel ${selectedNodeId || isFlowSettingsOpen ? 'is-open' : ''}`}>
-              <div className="config-panel-head">
-                <div className="config-panel-title">
-                  <strong>{selectedNode ? selectedNode.data.kind === "agent" ? "Agent 参数" : selectedNode.data.kind === "team" ? "Team 参数" : "节点配置" : "整体设置"}</strong>
-                  {selectedNode ? <span>{selectedNode.data.kind} · {selectedNode.id}</span> : selectedFlow ? <span>{selectedFlow.flowType} · {selectedFlow.id}</span> : null}
-                </div>
-                <button
-                  type="button"
-                  className="panel-close-button"
-                  onClick={() => {
-                    setSelectedNodeId(null);
-                    setIsFlowSettingsOpen(false);
-                  }}
-                  aria-label="关闭面板"
-                >
-                  ×
-                </button>
-              </div>
-              <div className="config-panel-body">
-                {selectedNode ? (
-                  <>
-                    <div className="config-panel-scroll">
-                      <div className="node-compact-row">
-                        <label className="flow-field flow-field-compact">
-                          <span>节点标题</span>
-                          <input
-                            value={selectedNode.data.label}
-                            onChange={(event) => updateSelectedNode({ label: event.target.value })}
-                          />
-                        </label>
-                      </div>
-                      {selectedNode.data.kind === "agent" ? (
-                        <FormProvider form={agentForm}>
-                          <div className="agent-config-form">
-                            <label className="flow-field flow-field-compact">
-                              <span>绑定 Agent</span>
-                              <select
-                                value={selectedNode.data.agentId ?? selectedNode.data.agentName ?? agentOptions[0]?.id ?? ""}
-                                disabled={agentOptions.length === 0}
-                                onChange={(event) =>
-                                  {
-                                    const agent = agentOptions.find((item) => item.id === event.target.value);
-                                    updateSelectedNode({
-                                      agentId: event.target.value,
-                                      agentName: agent?.name ?? event.target.value,
-                                      label: agent?.name ?? event.target.value,
-                                    });
-                                  }
-                                }
-                              >
-                                {agentOptions.length === 0 ? <option value="">暂无后端 Agent</option> : null}
-                                {agentOptions.map((agent) => (
-                                  <option key={agent.id} value={agent.id}>
-                                    {agent.name}
-                                  </option>
-                                ))}
-                              </select>
-                            </label>
-
-                            <div className="agent-config-grid">
-                              <label className="flow-field flow-field-compact">
-                                <span>Agent 名称</span>
-                                <Field name="name" component={[TextControl]} />
-                              </label>
-                              <label className="flow-field flow-field-compact">
-                                <span>模型</span>
-                                <Field name="model" component={[TextControl, { placeholder: "gpt-4.1-mini" }]} />
-                              </label>
-                            </div>
-
-                            <div className="agent-config-grid">
-                              <label className="flow-field flow-field-compact">
-                                <span>温度</span>
-                                <Field name="temperature" component={[TextControl, { placeholder: "0.2" }]} />
-                              </label>
-                              <label className="flow-field flow-field-compact">
-                                <span>最大重试次数</span>
-                                <Field name="maxRetry" component={[TextControl, { placeholder: "0" }]} />
-                              </label>
-                            </div>
-
-                            <label className="flow-field flow-field-compact">
-                              <span>详细指令</span>
-                              <Field name="instructions" component={[TextControl, { multiline: true, rows: 3 }]} />
-                            </label>
-
-                            <label className="flow-field flow-field-compact">
-                              <span>描述</span>
-                              <Field name="description" component={[TextControl, { multiline: true, rows: 2 }]} />
-                            </label>
-
-                            <div className="agent-config-grid">
-                              <label className="flow-field flow-field-compact">
-                                <span>技能 IDs</span>
-                                <Field name="skillIds" component={[TextControl, { placeholder: "skill_triage" }]} />
-                              </label>
-                              <label className="flow-field flow-field-compact">
-                                <span>知识库 IDs</span>
-                                <Field name="knowledgeIds" component={[TextControl, { placeholder: "kb_support" }]} />
-                              </label>
-                            </div>
-
-                            <label className="flow-field flow-field-compact">
-                              <span>工具 IDs</span>
-                              <Field name="toolIds" component={[TextControl, { placeholder: "tool_search, tool_http" }]} />
-                            </label>
-
-                            <div className="agent-config-toggles">
-                              <Field name="stream" component={[ToggleControl, { label: "流式输出" }]} />
-                              <Field name="debug" component={[ToggleControl, { label: "调试" }]} />
-                            </div>
-
-                            <button type="button" className="flow-primary-button agent-save-button" onClick={saveSelectedAgent}>
-                              {isAgentSaving ? "保存中..." : "保存 Agent"}
-                            </button>
-                          </div>
-                        </FormProvider>
-                      ) : null}
-                      {selectedNode.data.kind === "team" ? (
-                        <label className="flow-field flow-field-compact">
-                          <span>绑定 Team</span>
-                          <select
-                            value={selectedNode.data.teamId ?? teamOptions[0]?.id ?? ""}
-                            disabled={teamOptions.length === 0}
-                            onChange={(event) => {
-                              const team = teamOptions.find((item) => item.id === event.target.value);
-                              updateSelectedNode({
-                                teamId: event.target.value,
-                                teamName: team?.name ?? event.target.value,
-                                label: team?.name ?? event.target.value,
-                                teamDescription: team?.description ?? "",
-                                teamStrategy: team?.strategy ?? "parallel",
-                                memberAgentIds: team?.member_agent_ids ?? [],
-                              });
-                            }}
-                          >
-                            {teamOptions.length === 0 ? <option value="">暂无后端 Team</option> : null}
-                            {teamOptions.map((team) => (
-                              <option key={team.id} value={team.id}>
-                                {team.name}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                      ) : null}
-                      {selectedNode.data.kind === "agent" || selectedNode.data.kind === "team" ? (
-                        <div className="retry-config-card">
-                          <div className="config-section-title">
-                            <strong>失败回流</strong>
-                            <span>失败时回跳</span>
-                          </div>
-                          <div className="agent-config-grid">
-                            <label className="flow-field flow-field-compact">
-                              <span>最大重试</span>
-                              <input
-                                type="number"
-                                min={0}
-                                value={selectedNode.data.maxRetry ?? 0}
-                                onChange={(event) => updateSelectedNode({ maxRetry: Number(event.target.value) })}
-                              />
-                            </label>
-                            <label className="flow-field flow-field-compact">
-                              <span>失败跳转</span>
-                              <select
-                                value={selectedNode.data.onFail ?? ""}
-                                onChange={(event) => {
-                                  const targetId = event.target.value;
-                                  updateSelectedNode({ onFail: targetId });
-                                  setEdges((current) => {
-                                    const withoutOldFailure = current.filter(
-                                      (edge) => !(edge.source === selectedNode.id && edge.data?.branch === "failure"),
-                                    );
-
-                                    if (!targetId) {
-                                      return withoutOldFailure;
-                                    }
-
-                                    return addEdge(
-                                      {
-                                        id: `edge_${selectedNode.id}_${targetId}_failure`,
-                                        source: selectedNode.id,
-                                        target: targetId,
-                                    animated: true,
-                                    className: "flow-edge-failure",
-                                    data: { branch: "failure" },
-                                  },
-                                  withoutOldFailure,
-                                );
-                              });
-                            }}
-                          >
-                            <option value="">不回流</option>
-                            {nodes
-                              .filter((node) => node.id !== selectedNode.id)
-                              .map((node) => (
-                                <option key={node.id} value={node.id}>
-                                  {node.data.label}
-                                </option>
-                              ))}
-                          </select>
-                        </label>
-                      </div>
-                        </div>
-                      ) : null}
-                      {selectedNode.data.kind === "team" ? (
-                        <div className="team-config-card">
-                      <div>
-                        <strong>Team 子编排</strong>
-                        <p>嵌套已有 Agent，支持并行/串行。</p>
-                      </div>
-                      <label className="flow-field flow-field-compact">
-                        <span>Team 描述</span>
-                        <textarea
-                          rows={2}
-                          value={selectedNode.data.teamDescription ?? ""}
-                          onChange={(event) => updateSelectedNode({ teamDescription: event.target.value })}
-                        />
-                      </label>
-                      <label className="flow-field flow-field-compact">
-                        <span>执行策略</span>
-                        <select
-                          value={selectedNode.data.teamStrategy ?? "parallel"}
-                          onChange={(event) =>
-                            updateSelectedNode({ teamStrategy: event.target.value as "parallel" | "sequential" })
-                          }
-                        >
-                          <option value="parallel">parallel 并行</option>
-                          <option value="sequential">sequential 串行</option>
-                        </select>
-                      </label>
-                      <label className="flow-field flow-field-compact">
-                        <span>成员 Agent IDs</span>
-                        <input
-                          value={joinIds(selectedNode.data.memberAgentIds)}
-                          onChange={(event) => updateSelectedNode({ memberAgentIds: splitIds(event.target.value) })}
-                          placeholder="agent_a, agent_b"
-                        />
-                      </label>
-                        </div>
-                      ) : null}
-
-                      {selectedNode.data.kind === "condition" ? (
-                        <div className="condition-config-card">
-                          <div className="config-section-title">
-                            <strong>条件分支配置</strong>
-                            <span>根据条件路由到不同分支</span>
-                          </div>
-
-                          <label className="flow-field flow-field-compact">
-                            <span>条件类型</span>
-                            <select
-                              value={selectedNode.data.conditionType ?? "expression"}
-                              onChange={(event) =>
-                                updateSelectedNode({
-                                  conditionType: event.target.value as StudioNodeData["conditionType"],
-                                  branches: [{ id: "branch_1", label: "分支 1", conditionValue: "" }, { id: "branch_2", label: "分支 2", conditionValue: "" }],
-                                  defaultBranchId: "branch_2",
-                                })
-                              }
-                            >
-                              <option value="expression">表达式</option>
-                              <option value="llm_classify">LLM 分类</option>
-                              <option value="regex">正则匹配</option>
-                              <option value="json_schema">JSON Schema</option>
-                            </select>
-                          </label>
-
-                          <label className="flow-field flow-field-compact">
-                            <span>输入来源</span>
-                            <input
-                              value={selectedNode.data.inputSource ?? "{{input.user_message}}"}
-                              onChange={(event) => updateSelectedNode({ inputSource: event.target.value })}
-                              placeholder="{{input.user_message}}"
-                            />
-                          </label>
-
-                          {selectedNode.data.conditionType === "expression" && (
-                            <label className="flow-field flow-field-compact">
-                              <span>表达式</span>
-                              <input
-                                value={selectedNode.data.expression ?? ""}
-                                onChange={(event) => updateSelectedNode({ expression: event.target.value })}
-                                placeholder="{{input.priority}} === 'high'"
-                              />
-                            </label>
-                          )}
-
-                          {selectedNode.data.conditionType === "llm_classify" && (
-                            <>
-                              <label className="flow-field flow-field-compact">
-                                <span>模型</span>
-                                <input
-                                  value={selectedNode.data.llmConfig?.model ?? "gpt-4.1-mini"}
-                                  onChange={(event) =>
-                                    updateSelectedNode({
-                                      llmConfig: { ...selectedNode.data.llmConfig, model: event.target.value } as StudioNodeData["llmConfig"],
-                                    })
-                                  }
-                                  placeholder="gpt-4.1-mini"
-                                />
-                              </label>
-                              <label className="flow-field flow-field-compact">
-                                <span>分类提示词</span>
-                                <textarea
-                                  rows={2}
-                                  value={selectedNode.data.llmConfig?.prompt ?? ""}
-                                  onChange={(event) =>
-                                    updateSelectedNode({
-                                      llmConfig: { ...selectedNode.data.llmConfig, prompt: event.target.value } as StudioNodeData["llmConfig"],
-                                    })
-                                  }
-                                  placeholder="判断用户意图属于以下哪类..."
-                                />
-                              </label>
-                            </>
-                          )}
-
-                          <div className="config-section-title" style={{ marginTop: "12px" }}>
-                            <strong>分支定义</strong>
-                          </div>
-
-                          {(selectedNode.data.branches ?? []).map((branch, index) => (
-                            <div key={branch.id} className="node-compact-row">
-                              <label className="flow-field flow-field-compact">
-                                <span>分支 {index + 1} 名称</span>
-                                <input
-                                  value={branch.label}
-                                  onChange={(event) => {
-                                    const newBranches = [...(selectedNode.data.branches ?? [])];
-                                    newBranches[index] = { ...branch, label: event.target.value };
-                                    updateSelectedNode({ branches: newBranches });
-                                  }}
-                                />
-                              </label>
-                              {selectedNode.data.conditionType !== "expression" && (
-                                <label className="flow-field flow-field-compact">
-                                  <span>匹配值</span>
-                                  <input
-                                    value={branch.conditionValue ?? ""}
-                                    onChange={(event) => {
-                                      const newBranches = [...(selectedNode.data.branches ?? [])];
-                                      newBranches[index] = { ...branch, conditionValue: event.target.value };
-                                      updateSelectedNode({ branches: newBranches });
-                                    }}
-                                    placeholder={selectedNode.data.conditionType === "regex" ? "正则表达式" : "匹配值"}
-                                  />
-                                </label>
-                              )}
-                            </div>
-                          ))}
-
-                          <button
-                            type="button"
-                            className="flow-secondary-button"
-                            style={{ marginTop: "8px", width: "100%" }}
-                            onClick={() => {
-                              const newBranch = {
-                                id: `branch_${Date.now()}`,
-                                label: `分支 ${(selectedNode.data.branches ?? []).length + 1}`,
-                                conditionValue: "",
-                              };
-                              updateSelectedNode({
-                                branches: [...(selectedNode.data.branches ?? []), newBranch],
-                              });
-                            }}
-                          >
-                            + 添加分支
-                          </button>
-                        </div>
-                      ) : null}
-                    </div>
-                    <RunConsole
-                      title="Run Console"
-                      isRunning={isRunStreaming}
-                      events={runEvents}
-                      result={runResult}
-                    />
-                  </>
-                ) : (
-                  selectedFlow ? (
-                    <>
-                      <div className="config-panel-scroll">
-                        <div className="flow-settings-card">
-                          <div className="config-section-title">
-                            <strong>Flow / Team 整体配置</strong>
-                            <span>点击节点可切换到节点参数</span>
-                          </div>
-
-                          <label className="flow-field flow-field-compact">
-                            <span>名称</span>
-                            <input
-                              value={selectedFlow.name}
-                              onChange={(event) => updateSelectedFlow({ name: event.target.value })}
-                            />
-                          </label>
-
-                          <label className="flow-field flow-field-compact">
-                            <span>类型</span>
-                            <select
-                              value={selectedFlow.flowType}
-                              onChange={(event) => updateSelectedFlow({ flowType: event.target.value as "agent" | "team" })}
-                            >
-                              <option value="agent">Agent 单 Agent</option>
-                              <option value="team">Team 多 Agent</option>
-                            </select>
-                          </label>
-
-                          <label className="flow-field flow-field-compact">
-                            <span>描述</span>
-                            <textarea
-                              rows={3}
-                              value={selectedFlow.description}
-                              onChange={(event) => updateSelectedFlow({ description: event.target.value })}
-                            />
-                          </label>
-
-                          <div className="flow-settings-summary">
-                            <span>节点数：{nodes.length}</span>
-                            <span>Agent：{nodes.filter((node) => node.data.kind === "agent").length}</span>
-                            <span>Team：{nodes.filter((node) => node.data.kind === "team").length}</span>
-                          </div>
-                        </div>
-                      </div>
-                      <RunConsole
-                        title="Run Console"
-                        isRunning={isRunStreaming}
-                        events={runEvents}
-                        result={runResult}
-                      />
-                    </>
-                  ) : (
-                    <span>先创建或打开一个 Flow。</span>
-                  )
-                )}
-              </div>
-            </aside>
-          </div>
-
-          {isCreateModalOpen ? (
-            <div className="flow-modal-backdrop" onClick={() => setIsCreateModalOpen(false)}>
-              <form
-                className="flow-modal"
-                onClick={(event) => event.stopPropagation()}
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void createFlow();
-                }}
-              >
-                <div className="flow-modal-header">
-                  <strong>新建 Flow</strong>
-                  <button type="button" className="agent-link-button" onClick={() => setIsCreateModalOpen(false)}>
-                    关闭
-                  </button>
-                </div>
-                <label className="flow-field">
-                  <span>Flow 名称</span>
-                  <input value={newFlowName} onChange={(event) => setNewFlowName(event.target.value)} placeholder="例如：Customer Support Flow" />
-                </label>
-                <label className="flow-field">
-                  <span>类型</span>
-                  <select value={newFlowType} onChange={(event) => setNewFlowType(event.target.value as "agent" | "team")}>
-                    <option value="agent">Agent 单 Agent</option>
-                    <option value="team">Team 多 Agent</option>
-                  </select>
-                </label>
-                <label className="flow-field">
-                  <span>描述</span>
-                  <textarea
-                    value={newFlowDescription}
-                    onChange={(event) => setNewFlowDescription(event.target.value)}
-                    placeholder="描述这个 Flow 主要负责什么。"
-                    rows={4}
-                  />
-                </label>
-                <div className="flow-modal-actions">
-                  <button type="button" className="flow-secondary-button" onClick={() => setIsCreateModalOpen(false)}>
-                    取消
-                  </button>
-                  <button type="submit" className="flow-primary-button" disabled={isCreateDisabled}>
-                    创建并进入
-                  </button>
-                </div>
-              </form>
-            </div>
+          {flowError ? (
+            <div className="flow-inline-alert">{flowError}</div>
           ) : null}
+          <div className="flow-empty-state">
+            <strong>暂未打开数字人</strong>
+            <p>
+              你可以在“我的数字人”里选择任意 Agent 或 Team，然后进入 Studio
+              进行可视化编排。
+            </p>
+          </div>
         </div>
       </section>
     );
@@ -2195,219 +1840,820 @@ function FlowStudioContent() {
 
   return (
     <section className="workspace-canvas workspace-canvas-plain">
-      <div className="content-doc content-doc-flow flow-list-page">
+      <div className="content-doc content-doc-flow content-doc-flow-editor">
         <header className="flow-page-header">
           <div>
-            <h2>Flows</h2>
-            <p>{isFlowLoading ? "正在同步本地后端 Flow..." : `${flows.length} 个工作流`}</p>
+            <h2>{selectedFlow.name}</h2>
+            <p>
+              {selectedFlow.flowType === "team"
+                ? "Team 可编排工作区"
+                : "Agent 可视化工作区"}
+              {selectedFlow.isExposed ? " · 已暴露" : " · 内部编排"}
+              {selectedFlow.isPrimary ? " · 主入口" : ""}
+            </p>
           </div>
 
           <div className="flow-header-actions">
-            <button type="button" className="flow-primary-button" onClick={() => setIsCreateModalOpen(true)}>
-              新建 Flow
+            <button
+              type="button"
+              className="flow-secondary-button"
+              onClick={onBackToAssets}
+            >
+              返回我的数字人
+            </button>
+            <button
+              type="button"
+              className="flow-secondary-button"
+              onClick={deleteSelectedNode}
+            >
+              删除节点
+            </button>
+            <button
+              type="button"
+              className="flow-secondary-button"
+              onClick={saveCurrentFlow}
+              disabled={isFlowSaving}
+            >
+              {isFlowSaving ? "保存中..." : "保存编排"}
+            </button>
+            <button
+              type="button"
+              className="flow-primary-button"
+              onClick={runCurrentFlow}
+            >
+              {isRunStreaming ? "运行中..." : "运行调试"}
             </button>
           </div>
         </header>
 
-        {flowError ? <div className="flow-inline-alert">{flowError}</div> : null}
-
-        <div className="agent-list flow-list-card">
-          {flows.length === 0 ? (
-            <div className="flow-empty-state">
-              <strong>暂无 Flow</strong>
-              <p>点击“新建 Flow”创建第一个本地编排。</p>
-            </div>
-          ) : (
-            flows.map((flow) => (
-              <article
-                key={flow.id}
-                className={`agent-row ${selectedFlowId === flow.id ? "is-selected" : ""}`}
-                onClick={() => setSelectedFlowId(flow.id)}
-              >
-                <div className="agent-row-main">
-                  <div className={`agent-status agent-status-${flow.status === "published" ? "active" : "draft"}`} />
-                  <div>
-                    <strong>{flow.name}</strong>
-                    <p>{flow.description}</p>
-                  </div>
-                </div>
-
-                <div className="agent-row-meta">
-                  <span>{flow.status}</span>
-                  <span>{flow.flowType === "team" ? "Team" : "Agent"}</span>
-                  <span>{flow.resources.length ? flow.resources.join(" / ") : "未绑定资源"}</span>
-                  <span>{flow.updatedAt}</span>
-                </div>
-
-                <div className="agent-row-actions">
-                  <button
-                    type="button"
-                    className="agent-link-button"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      void openFlowEditor(flow);
-                    }}
-                  >
-                    打开
-                  </button>
-                </div>
-              </article>
-            ))
-          )}
-        </div>
-
-        {isCreateModalOpen ? (
-          <div className="flow-modal-backdrop" onClick={() => setIsCreateModalOpen(false)}>
-            <form
-              className="flow-modal"
-              onClick={(event) => event.stopPropagation()}
-              onSubmit={(event) => {
-                event.preventDefault();
-                void createFlow();
-              }}
-            >
-              <div className="flow-modal-header">
-                <strong>新建 Flow</strong>
-                <button type="button" className="agent-link-button" onClick={() => setIsCreateModalOpen(false)}>
-                  关闭
-                </button>
-              </div>
-              <label className="flow-field">
-                <span>Flow 名称</span>
-                <input value={newFlowName} onChange={(event) => setNewFlowName(event.target.value)} placeholder="例如：Customer Support Flow" />
-              </label>
-              <label className="flow-field">
-                <span>描述</span>
-                <textarea
-                  value={newFlowDescription}
-                  onChange={(event) => setNewFlowDescription(event.target.value)}
-                  placeholder="描述这个 Flow 主要负责什么。"
-                  rows={4}
-                />
-              </label>
-              <div className="flow-modal-actions">
-                <button type="button" className="flow-secondary-button" onClick={() => setIsCreateModalOpen(false)}>
-                  取消
-                </button>
-                <button type="submit" className="flow-primary-button" disabled={isCreateDisabled}>
-                  创建并进入
-                </button>
-              </div>
-            </form>
-          </div>
+        {flowError ? (
+          <div className="flow-inline-alert">{flowError}</div>
         ) : null}
-      </div>
-    </section>
-  );
-}
 
-function AgentsWorkspace() {
-  const [agents, setAgents] = useState<BackendAgent[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+        <div
+          className={`flow-editor-shell ${selectedNodeId || isFlowSettingsOpen ? "has-panel-open" : ""}`}
+        >
+          <section className="flow-editor-canvas">
+            {canvasNotice ? (
+              <div className="flow-canvas-notice">{canvasNotice}</div>
+            ) : null}
+            <ReactFlowProvider>
+              <FlowCanvas
+                nodes={nodes}
+                edges={visibleEdges}
+                onNodesChange={onNodesChange}
+                onEdgesChange={onEdgesChange}
+                onConnect={onConnect}
+                expandedTeamNodeIds={
+                  previewTeamNodeId ? [previewTeamNodeId] : []
+                }
+                onToggleTeamMembers={toggleTeamMembers}
+                teamMemberNameMap={teamMemberNameMap}
+                onNodeClick={(_, node) => {
+                  setSelectedNodeId(node.id);
+                  setIsFlowSettingsOpen(false);
+                  if (node.data.kind === "team") {
+                    setPreviewTeamNodeId(node.id);
+                  }
+                }}
+                onPaneClick={() => {
+                  setSelectedNodeId(null);
+                  setIsFlowSettingsOpen(true);
+                  setNodeSelectorAnchor(null);
+                  setPreviewTeamNodeId(null);
+                }}
+                onAddNodeClick={openNodeSelectorFromNode}
+                onDeleteNodeClick={deleteNodeById}
+                focusNodeId={focusNodeId}
+                centerSignal={centerSignal}
+              />
+            </ReactFlowProvider>
+            <TeamPreviewModal
+              definition={previewTeamDefinition}
+              title={
+                previewTeamRecord
+                  ? `${previewTeamRecord.name} · Team 子图`
+                  : "Team 子图"
+              }
+              description={previewTeamRecord?.description}
+              onClose={() => setPreviewTeamNodeId(null)}
+            />
+            <FlowNodeSelector
+              anchor={nodeSelectorAnchor}
+              onClose={() => setNodeSelectorAnchor(null)}
+              onSelect={(kind, sourceNodeId) => addNode(kind, sourceNodeId)}
+            />
+          </section>
 
-  const loadAgents = useCallback(async () => {
-    setIsLoading(true);
-    setError(null);
-
-    try {
-      const nextAgents = await listBackendAgents();
-      setAgents(nextAgents);
-    } catch (agentError) {
-      setAgents([]);
-      setError(agentError instanceof Error ? agentError.message : "读取 Agent 列表失败");
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadAgents();
-  }, [loadAgents]);
-
-  return (
-    <section className="workspace-canvas workspace-canvas-plain">
-      <div className="content-doc content-doc-flow agent-hub-page">
-        <div className="flow-page-header">
-          <div>
-            <h2>Agent Hub</h2>
-            <p>先创建和维护单个 Agent，再在 Flow / Team 里选择它们完成编排。</p>
-          </div>
-          <div className="flow-header-actions">
-            <button type="button" className="flow-secondary-button" onClick={loadAgents} disabled={isLoading}>
-              {isLoading ? "刷新中" : "刷新"}
-            </button>
-            <button type="button" className="flow-primary-button" disabled title="下一步接创建 Agent 表单">
-              新建 Agent
-            </button>
-          </div>
-        </div>
-
-        {error ? <div className="flow-error">{error}</div> : null}
-
-        <div className="agent-hub-summary">
-          <span>{agents.length} 个 Agent</span>
-          <span>{agents.filter((agent) => agent.stream).length} 个流式输出</span>
-          <span>{agents.filter((agent) => agent.status === "active").length} 个启用中</span>
-        </div>
-
-        <div className="flow-list-card agent-hub-list">
-          {isLoading ? (
-            <div className="empty-flow-card">
-              <strong>正在加载 Agent</strong>
-              <p>从后端读取你已经创建好的单 Agent。</p>
+          <aside
+            className={`flow-editor-panel ${selectedNodeId || isFlowSettingsOpen ? "is-open" : ""}`}
+          >
+            <div className="config-panel-head">
+              <div className="config-panel-title">
+                <strong>
+                  {selectedNode
+                    ? selectedNode.data.kind === "agent"
+                      ? "Agent 参数"
+                      : selectedNode.data.kind === "team"
+                        ? "Team 参数"
+                        : "节点配置"
+                    : "整体设置"}
+                </strong>
+                {selectedNode ? (
+                  <span>
+                    {selectedNode.data.kind} · {selectedNode.id}
+                  </span>
+                ) : (
+                  <span>
+                    {selectedFlow.flowType} · {selectedFlow.id}
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                className="panel-close-button"
+                onClick={() => {
+                  setSelectedNodeId(null);
+                  setIsFlowSettingsOpen(false);
+                }}
+                aria-label="关闭面板"
+              >
+                ×
+              </button>
             </div>
-          ) : agents.length === 0 ? (
-            <div className="empty-flow-card">
-              <strong>暂无 Agent</strong>
-              <p>真实流程里应该先在这里创建荷官、玩家、裁判等 Agent，再去 Flow 编排。</p>
-            </div>
-          ) : (
-            agents.map((agent) => (
-              <article key={agent.id} className="agent-row agent-hub-row">
-                <div className="agent-row-main">
-                  <span className={`agent-status ${agent.status === "active" ? "agent-status-active" : "agent-status-draft"}`} />
-                  <div>
-                    <strong>{agent.name}</strong>
-                    <p>{agent.description || agent.role || "暂无描述"}</p>
+            <div className="config-panel-body">
+              {selectedNode ? (
+                <>
+                  <div className="config-panel-scroll">
+                    <div className="node-compact-row">
+                      <label className="flow-field flow-field-compact">
+                        <span>节点标题</span>
+                        <input
+                          value={selectedNode.data.label}
+                          onChange={(event) =>
+                            updateSelectedNode({ label: event.target.value })
+                          }
+                        />
+                      </label>
+                    </div>
+                    {selectedNode.data.kind === "agent" ? (
+                      <FormProvider form={agentForm}>
+                        <div className="agent-config-form">
+                          <label className="flow-field flow-field-compact">
+                            <span>绑定 Agent</span>
+                            <select
+                              value={
+                                selectedNode.data.agentId ??
+                                selectedNode.data.agentName ??
+                                agentOptions[0]?.id ??
+                                ""
+                              }
+                              disabled={agentOptions.length === 0}
+                              onChange={(event) => {
+                                const agent = agentOptions.find(
+                                  (item) => item.id === event.target.value,
+                                );
+                                updateSelectedNode({
+                                  agentId: event.target.value,
+                                  agentName: agent?.name ?? event.target.value,
+                                  label: agent?.name ?? event.target.value,
+                                });
+                              }}
+                            >
+                              {agentOptions.length === 0 ? (
+                                <option value="">暂无后端 Agent</option>
+                              ) : null}
+                              {agentOptions.map((agent) => (
+                                <option key={agent.id} value={agent.id}>
+                                  {agent.name}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+
+                          <div className="agent-config-grid">
+                            <label className="flow-field flow-field-compact">
+                              <span>Agent 名称</span>
+                              <Field name="name" component={[TextControl]} />
+                            </label>
+                            <label className="flow-field flow-field-compact">
+                              <span>模型</span>
+                              <Field
+                                name="model"
+                                component={[
+                                  TextControl,
+                                  { placeholder: "gpt-4.1-mini" },
+                                ]}
+                              />
+                            </label>
+                          </div>
+
+                          <div className="agent-config-grid">
+                            <label className="flow-field flow-field-compact">
+                              <span>温度</span>
+                              <Field
+                                name="temperature"
+                                component={[
+                                  TextControl,
+                                  { placeholder: "0.2" },
+                                ]}
+                              />
+                            </label>
+                            <label className="flow-field flow-field-compact">
+                              <span>最大重试次数</span>
+                              <Field
+                                name="maxRetry"
+                                component={[TextControl, { placeholder: "0" }]}
+                              />
+                            </label>
+                          </div>
+
+                          <label className="flow-field flow-field-compact">
+                            <span>详细指令</span>
+                            <Field
+                              name="instructions"
+                              component={[
+                                TextControl,
+                                { multiline: true, rows: 3 },
+                              ]}
+                            />
+                          </label>
+
+                          <label className="flow-field flow-field-compact">
+                            <span>描述</span>
+                            <Field
+                              name="description"
+                              component={[
+                                TextControl,
+                                { multiline: true, rows: 2 },
+                              ]}
+                            />
+                          </label>
+
+                          <div className="agent-config-grid">
+                            <label className="flow-field flow-field-compact">
+                              <span>技能 IDs</span>
+                              <Field
+                                name="skillIds"
+                                component={[
+                                  TextControl,
+                                  { placeholder: "skill_triage" },
+                                ]}
+                              />
+                            </label>
+                            <label className="flow-field flow-field-compact">
+                              <span>知识库 IDs</span>
+                              <Field
+                                name="knowledgeIds"
+                                component={[
+                                  TextControl,
+                                  { placeholder: "kb_support" },
+                                ]}
+                              />
+                            </label>
+                          </div>
+
+                          <label className="flow-field flow-field-compact">
+                            <span>工具 IDs</span>
+                            <Field
+                              name="toolIds"
+                              component={[
+                                TextControl,
+                                { placeholder: "tool_search, tool_http" },
+                              ]}
+                            />
+                          </label>
+
+                          <div className="agent-config-toggles">
+                            <Field
+                              name="stream"
+                              component={[ToggleControl, { label: "流式输出" }]}
+                            />
+                            <Field
+                              name="debug"
+                              component={[ToggleControl, { label: "调试" }]}
+                            />
+                          </div>
+
+                          <button
+                            type="button"
+                            className="flow-primary-button agent-save-button"
+                            onClick={saveSelectedAgent}
+                          >
+                            {isAgentSaving ? "保存中..." : "保存 Agent"}
+                          </button>
+                        </div>
+                      </FormProvider>
+                    ) : null}
+                    {selectedNode.data.kind === "team" ? (
+                      <>
+                        <label className="flow-field flow-field-compact">
+                          <span>绑定 Team</span>
+                          <select
+                            value={
+                              selectedNode.data.teamId ??
+                              teamOptions[0]?.id ??
+                              ""
+                            }
+                            disabled={teamOptions.length === 0}
+                            onChange={(event) => {
+                              const team = teamOptions.find(
+                                (item) => item.id === event.target.value,
+                              );
+                              updateSelectedNode({
+                                teamId: event.target.value,
+                                teamName: team?.name ?? event.target.value,
+                                label: team?.name ?? event.target.value,
+                                teamDescription: team?.description ?? "",
+                                teamStrategy: team?.strategy ?? "parallel",
+                                memberAgentIds: team?.member_agent_ids ?? [],
+                                memberCount:
+                                  team?.member_agent_ids?.length ?? 0,
+                              });
+                            }}
+                          >
+                            {teamOptions.length === 0 ? (
+                              <option value="">暂无后端 Team</option>
+                            ) : null}
+                            {teamOptions.map((team) => (
+                              <option key={team.id} value={team.id}>
+                                {team.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <button
+                          type="button"
+                          className="flow-secondary-button"
+                          onClick={() => toggleTeamMembers(selectedNode.id)}
+                        >
+                          {previewTeamNodeId === selectedNode.id
+                            ? "关闭 Team 子图"
+                            : "查看 Team 子图"}
+                        </button>
+                      </>
+                    ) : null}
+                    {selectedNode.data.kind === "agent" ||
+                    selectedNode.data.kind === "team" ? (
+                      <div className="retry-config-card">
+                        <div className="config-section-title">
+                          <strong>失败回流</strong>
+                          <span>失败时回跳</span>
+                        </div>
+                        <div className="agent-config-grid">
+                          <label className="flow-field flow-field-compact">
+                            <span>最大重试</span>
+                            <input
+                              type="number"
+                              min={0}
+                              value={selectedNode.data.maxRetry ?? 0}
+                              onChange={(event) =>
+                                updateSelectedNode({
+                                  maxRetry: Number(event.target.value),
+                                })
+                              }
+                            />
+                          </label>
+                          <label className="flow-field flow-field-compact">
+                            <span>失败跳转</span>
+                            <select
+                              value={selectedNode.data.onFail ?? ""}
+                              onChange={(event) => {
+                                const targetId = event.target.value;
+                                updateSelectedNode({ onFail: targetId });
+                                setEdges((current) => {
+                                  const withoutOldFailure = current.filter(
+                                    (edge) =>
+                                      !(
+                                        edge.source === selectedNode.id &&
+                                        edge.data?.branch === "failure"
+                                      ),
+                                  );
+
+                                  if (!targetId) {
+                                    return withoutOldFailure;
+                                  }
+
+                                  return addEdge(
+                                    {
+                                      id: `edge_${selectedNode.id}_${targetId}_failure`,
+                                      source: selectedNode.id,
+                                      target: targetId,
+                                      animated: true,
+                                      className: "flow-edge-failure",
+                                      data: { branch: "failure" },
+                                    },
+                                    withoutOldFailure,
+                                  );
+                                });
+                              }}
+                            >
+                              <option value="">不回流</option>
+                              {nodes
+                                .filter((node) => node.id !== selectedNode.id)
+                                .map((node) => (
+                                  <option key={node.id} value={node.id}>
+                                    {node.data.label}
+                                  </option>
+                                ))}
+                            </select>
+                          </label>
+                        </div>
+                      </div>
+                    ) : null}
+                    {selectedNode.data.kind === "team" ? (
+                      <div className="team-config-card">
+                        <div>
+                          <strong>Team 子编排</strong>
+                          <p>嵌套已有 Agent，支持并行/串行。</p>
+                        </div>
+                        <label className="flow-field flow-field-compact">
+                          <span>Team 描述</span>
+                          <textarea
+                            rows={2}
+                            value={selectedNode.data.teamDescription ?? ""}
+                            onChange={(event) =>
+                              updateSelectedNode({
+                                teamDescription: event.target.value,
+                              })
+                            }
+                          />
+                        </label>
+                        <label className="flow-field flow-field-compact">
+                          <span>执行策略</span>
+                          <select
+                            value={selectedNode.data.teamStrategy ?? "parallel"}
+                            onChange={(event) =>
+                              updateSelectedNode({
+                                teamStrategy: event.target.value as
+                                  | "parallel"
+                                  | "sequential",
+                              })
+                            }
+                          >
+                            <option value="parallel">parallel 并行</option>
+                            <option value="sequential">sequential 串行</option>
+                          </select>
+                        </label>
+                        <label className="flow-field flow-field-compact">
+                          <span>成员 Agent IDs</span>
+                          <input
+                            value={joinIds(selectedNode.data.memberAgentIds)}
+                            onChange={(event) => {
+                              const memberAgentIds = splitIds(
+                                event.target.value,
+                              );
+                              updateSelectedNode({
+                                memberAgentIds,
+                                memberCount: memberAgentIds.length,
+                              });
+                            }}
+                            placeholder="agent_a, agent_b"
+                          />
+                        </label>
+                      </div>
+                    ) : null}
+
+                    {selectedNode.data.kind === "condition" ? (
+                      <div className="condition-config-card">
+                        <div className="config-section-title">
+                          <strong>条件分支配置</strong>
+                          <span>根据条件路由到不同分支</span>
+                        </div>
+
+                        <label className="flow-field flow-field-compact">
+                          <span>条件类型</span>
+                          <select
+                            value={
+                              selectedNode.data.conditionType ?? "expression"
+                            }
+                            onChange={(event) =>
+                              updateSelectedNode({
+                                conditionType: event.target
+                                  .value as StudioNodeData["conditionType"],
+                                branches: [
+                                  {
+                                    id: "branch_1",
+                                    label: "分支 1",
+                                    conditionValue: "",
+                                  },
+                                  {
+                                    id: "branch_2",
+                                    label: "分支 2",
+                                    conditionValue: "",
+                                  },
+                                ],
+                                defaultBranchId: "branch_2",
+                              })
+                            }
+                          >
+                            <option value="expression">表达式</option>
+                            <option value="llm_classify">LLM 分类</option>
+                            <option value="regex">正则匹配</option>
+                            <option value="json_schema">JSON Schema</option>
+                          </select>
+                        </label>
+
+                        <label className="flow-field flow-field-compact">
+                          <span>输入来源</span>
+                          <input
+                            value={
+                              selectedNode.data.inputSource ??
+                              "{{input.user_message}}"
+                            }
+                            onChange={(event) =>
+                              updateSelectedNode({
+                                inputSource: event.target.value,
+                              })
+                            }
+                            placeholder="{{input.user_message}}"
+                          />
+                        </label>
+
+                        {selectedNode.data.conditionType === "expression" && (
+                          <label className="flow-field flow-field-compact">
+                            <span>表达式</span>
+                            <input
+                              value={selectedNode.data.expression ?? ""}
+                              onChange={(event) =>
+                                updateSelectedNode({
+                                  expression: event.target.value,
+                                })
+                              }
+                              placeholder="{{input.priority}} === 'high'"
+                            />
+                          </label>
+                        )}
+
+                        {selectedNode.data.conditionType === "llm_classify" && (
+                          <>
+                            <label className="flow-field flow-field-compact">
+                              <span>模型</span>
+                              <input
+                                value={
+                                  selectedNode.data.llmConfig?.model ??
+                                  "gpt-4.1-mini"
+                                }
+                                onChange={(event) =>
+                                  updateSelectedNode({
+                                    llmConfig: {
+                                      ...selectedNode.data.llmConfig,
+                                      model: event.target.value,
+                                    } as StudioNodeData["llmConfig"],
+                                  })
+                                }
+                                placeholder="gpt-4.1-mini"
+                              />
+                            </label>
+                            <label className="flow-field flow-field-compact">
+                              <span>分类提示词</span>
+                              <textarea
+                                rows={2}
+                                value={
+                                  selectedNode.data.llmConfig?.prompt ?? ""
+                                }
+                                onChange={(event) =>
+                                  updateSelectedNode({
+                                    llmConfig: {
+                                      ...selectedNode.data.llmConfig,
+                                      prompt: event.target.value,
+                                    } as StudioNodeData["llmConfig"],
+                                  })
+                                }
+                                placeholder="判断用户意图属于以下哪类..."
+                              />
+                            </label>
+                          </>
+                        )}
+
+                        <div
+                          className="config-section-title"
+                          style={{ marginTop: "12px" }}
+                        >
+                          <strong>分支定义</strong>
+                        </div>
+
+                        {(selectedNode.data.branches ?? []).map(
+                          (branch, index) => (
+                            <div key={branch.id} className="node-compact-row">
+                              <label className="flow-field flow-field-compact">
+                                <span>分支 {index + 1} 名称</span>
+                                <input
+                                  value={branch.label}
+                                  onChange={(event) => {
+                                    const newBranches = [
+                                      ...(selectedNode.data.branches ?? []),
+                                    ];
+                                    newBranches[index] = {
+                                      ...branch,
+                                      label: event.target.value,
+                                    };
+                                    updateSelectedNode({
+                                      branches: newBranches,
+                                    });
+                                  }}
+                                />
+                              </label>
+                              {selectedNode.data.conditionType !==
+                                "expression" && (
+                                <label className="flow-field flow-field-compact">
+                                  <span>匹配值</span>
+                                  <input
+                                    value={branch.conditionValue ?? ""}
+                                    onChange={(event) => {
+                                      const newBranches = [
+                                        ...(selectedNode.data.branches ?? []),
+                                      ];
+                                      newBranches[index] = {
+                                        ...branch,
+                                        conditionValue: event.target.value,
+                                      };
+                                      updateSelectedNode({
+                                        branches: newBranches,
+                                      });
+                                    }}
+                                    placeholder={
+                                      selectedNode.data.conditionType ===
+                                      "regex"
+                                        ? "正则表达式"
+                                        : "匹配值"
+                                    }
+                                  />
+                                </label>
+                              )}
+                            </div>
+                          ),
+                        )}
+
+                        <button
+                          type="button"
+                          className="flow-secondary-button"
+                          style={{ marginTop: "8px", width: "100%" }}
+                          onClick={() => {
+                            const newBranch = {
+                              id: `branch_${Date.now()}`,
+                              label: `分支 ${(selectedNode.data.branches ?? []).length + 1}`,
+                              conditionValue: "",
+                            };
+                            updateSelectedNode({
+                              branches: [
+                                ...(selectedNode.data.branches ?? []),
+                                newBranch,
+                              ],
+                            });
+                          }}
+                        >
+                          + 添加分支
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
-                </div>
-                <div className="agent-row-meta">
-                  <span>{agent.stream ? "stream" : "normal"}</span>
-                  <span>{agent.status}</span>
-                  <span>{agent.owner_user_id || "local"}</span>
-                </div>
-                <div className="agent-row-actions">
-                  <span className="agent-row-id">{agent.id}</span>
-                </div>
-              </article>
-            ))
-          )}
+                  <RunConsole
+                    title="Run Console"
+                    isRunning={isRunStreaming}
+                    events={runEvents}
+                    result={runResult}
+                  />
+                </>
+              ) : (
+                <>
+                  <div className="config-panel-scroll">
+                    <div className="flow-settings-card">
+                      <div className="config-section-title">
+                        <strong>数字人整体配置</strong>
+                        <span>点击节点可切换到节点参数</span>
+                      </div>
+
+                      <label className="flow-field flow-field-compact">
+                        <span>名称</span>
+                        <input
+                          value={selectedFlow.name}
+                          onChange={(event) =>
+                            updateSelectedFlow({ name: event.target.value })
+                          }
+                        />
+                      </label>
+
+                      <label className="flow-field flow-field-compact">
+                        <span>类型</span>
+                        <select
+                          value={selectedFlow.flowType}
+                          onChange={(event) =>
+                            updateSelectedFlow({
+                              flowType: event.target.value as "agent" | "team",
+                            })
+                          }
+                        >
+                          <option value="agent">Agent</option>
+                          <option value="team">Team</option>
+                        </select>
+                      </label>
+
+                      <label className="flow-field flow-field-compact">
+                        <span>描述</span>
+                        <textarea
+                          rows={3}
+                          value={selectedFlow.description}
+                          onChange={(event) =>
+                            updateSelectedFlow({
+                              description: event.target.value,
+                            })
+                          }
+                        />
+                      </label>
+
+                      <label className="flow-field flow-field-compact">
+                        <span>首页欢迎文案</span>
+                        <textarea
+                          rows={4}
+                          placeholder="进入运行台后，这个数字人先怎么介绍自己"
+                          value={selectedFlowHomeConfig.welcomeMessage ?? ""}
+                          onChange={(event) =>
+                            updateSelectedFlowHomeConfig({
+                              welcomeMessage: event.target.value,
+                            })
+                          }
+                        />
+                      </label>
+
+                      <label className="flow-field flow-field-compact">
+                        <span>首页快捷提示</span>
+                        <textarea
+                          rows={4}
+                          placeholder={"每行一个提示词，例如：\n介绍一下你的规则\n直接开始执行"}
+                          value={joinPromptLines(selectedFlowHomeConfig.starterPrompts)}
+                          onChange={(event) =>
+                            updateSelectedFlowHomeConfig({
+                              starterPrompts: splitPromptLines(event.target.value),
+                            })
+                          }
+                        />
+                      </label>
+
+                      <div className="flow-settings-summary">
+                        <span>节点数：{nodes.length}</span>
+                        <span>
+                          Agent：
+                          {
+                            nodes.filter((node) => node.data.kind === "agent")
+                              .length
+                          }
+                        </span>
+                        <span>
+                          Team：
+                          {
+                            nodes.filter((node) => node.data.kind === "team")
+                              .length
+                          }
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                  <RunConsole
+                    title="Run Console"
+                    isRunning={isRunStreaming}
+                    events={runEvents}
+                    result={runResult}
+                  />
+                </>
+              )}
+            </div>
+          </aside>
         </div>
       </div>
     </section>
   );
 }
 
-function AppWindowContent({ app }: { app: DesktopApp }) {
-  if (app.id === "home") {
-    return <HomeFlowConsole />;
-  }
-
-  if (app.id === "flow") {
-    return <FlowStudioContent />;
-  }
-
-  if (app.id === "agents") {
-    return <AgentsWorkspace />;
-  }
+function AppWindowContent({
+  app,
+  onOpenStudio,
+  onRunFlow,
+  onBackToAssets,
+}: {
+  app: DesktopApp;
+  onOpenStudio: (flowId: string) => void;
+  onRunFlow: (flowId: string) => void;
+  onBackToAssets: () => void;
+}) {
+  if (app.id === "home") return <HomeFlowConsole />;
+  if (app.id === "studio")
+    return (
+      <StudioWorkspace onRunFlow={onRunFlow} onBackToAssets={onBackToAssets} />
+    );
+  if (app.id === "flow")
+    return <FlowStudioContent onBackToAssets={onBackToAssets} />;
+  if (app.id === "agents")
+    return (
+      <AgentsWorkspace onOpenStudio={onOpenStudio} onRunFlow={onRunFlow} />
+    );
 
   const sections =
     app.id === "skills"
-        ? skillSections
-        : app.id === "knowledge"
-          ? knowledgeSections
-          : mcpSections;
+      ? skillSections
+      : app.id === "knowledge"
+        ? knowledgeSections
+        : mcpSections;
 
   return (
     <section className="workspace-canvas workspace-canvas-plain">
@@ -2446,7 +2692,10 @@ export default function HomePage() {
   });
   const [isDockCollapsed, setIsDockCollapsed] = useState(false);
   const [isWindowClosed, setIsWindowClosed] = useState(false);
-  const [windowPosition, setWindowPosition] = useState<{ x: number; y: number } | null>(null);
+  const [windowPosition, setWindowPosition] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
   const [isWindowDragging, setIsWindowDragging] = useState(false);
 
   const activeApp = useMemo(
@@ -2458,7 +2707,6 @@ export default function HomePage() {
     replaceRouteQuery({
       app: activeAppId === "home" ? null : activeAppId,
       mode: windowMode === "maximized" ? null : windowMode,
-      view: activeAppId === "flow" ? readQueryParam("view") : null,
       flow: activeAppId === "flow" ? readQueryParam("flow") : null,
     });
   }, [activeAppId, windowMode]);
@@ -2485,9 +2733,34 @@ export default function HomePage() {
   }, []);
 
   const openApp = (id: AppId) => {
+    replaceRouteQuery({
+      app: id === "home" ? null : id,
+      mode: id === "home" ? null : readQueryParam("mode"),
+    });
     setActiveAppId(id);
     setIsWindowClosed(false);
-    setWindowMode((mode) => (id === "home" || mode === "minimized" ? "normal" : mode));
+    setWindowMode((mode) =>
+      id === "home" || mode === "minimized" ? "normal" : mode,
+    );
+  };
+
+  const openStudioFlow = (flowId: string) => {
+    replaceRouteQuery({ app: "flow", flow: flowId, mode: null });
+    setActiveAppId("flow");
+    setIsWindowClosed(false);
+    setWindowMode("maximized");
+  };
+
+  const runFlowAsset = (flowId: string) => {
+    replaceRouteQuery({
+      app: null,
+      mode: null,
+      flow: flowId,
+      agent: null,
+    });
+    setActiveAppId("home");
+    setIsWindowClosed(false);
+    setWindowMode("normal");
   };
 
   const startWindowDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -2495,7 +2768,10 @@ export default function HomePage() {
       return;
     }
 
-    if (event.target instanceof Element && event.target.closest(".window-actions")) {
+    if (
+      event.target instanceof Element &&
+      event.target.closest(".window-actions")
+    ) {
       return;
     }
 
@@ -2541,7 +2817,7 @@ export default function HomePage() {
     setWindowMode("normal");
     setActiveAppId("home");
     setIsWindowClosed(true);
-    replaceRouteQuery({ app: null, mode: null, view: null, flow: null });
+    replaceRouteQuery({ app: null, mode: null, flow: null });
   };
 
   const showWindow = !isWindowClosed && windowMode !== "minimized";
@@ -2560,13 +2836,16 @@ export default function HomePage() {
   }, [activeAppId, showWindow, windowMode]);
 
   return (
-    <main className={`desktop-scene ${isFullscreen ? "is-window-maximized" : ""}`}>
+    <main
+      className={`desktop-scene ${isFullscreen ? "is-window-maximized" : ""}`}
+    >
       <div className="desktop-noise" />
       <div className="desktop-grid" />
-
       <header className="topbar">
         <div className="topbar-left">
-          <div className="brand-mark">A</div>
+          <div className="brand-mark">
+            <img src="/icon.svg" alt="Agent Studio" className="brand-mark-icon" />
+          </div>
           <div className="crumb">Agent Studio</div>
           <span className="crumb-sep">/</span>
           <div className="workspace-chip">
@@ -2580,11 +2859,11 @@ export default function HomePage() {
             <span className="status-light" />
             v1.0
           </span>
-          <button type="button" onClick={() => openApp("flow")}>
-            Flows
-          </button>
           <button type="button" onClick={() => openApp("agents")}>
-            Agents
+            我的数字人
+          </button>
+          <button type="button" onClick={() => openApp("studio")}>
+            Studio
           </button>
           <button type="button" onClick={() => openApp("home")}>
             Runs
@@ -2598,20 +2877,35 @@ export default function HomePage() {
           <div>
             <span className="stage-kicker">Workspace</span>
             <h2>Agent Studio 桌面工作台</h2>
-            <p>从首页进入 Flow、Agent、Skills、Knowledge 与 MCP，逐步搭起你的多 Agent 平台。</p>
+            <p>
+              Studio 负责查看对外数字人；内部 Agent / Team
+              的创建、配置和编排，继续从“我的数字人”进入。
+            </p>
           </div>
-          <div className="desktop-tip">点击下方或中间入口，打开对应工作区。</div>
+          <div className="desktop-tip">
+            点击下方或中间入口，打开对应工作区。
+          </div>
         </div>
 
         <section className="desktop-icons">
-          {apps.slice(1).map((app) => (
-            <button key={app.id} type="button" className="desktop-icon" onClick={() => openApp(app.id)}>
-              <div className="desktop-icon-tile" style={{ background: app.color }}>
-                <AppGlyph icon={app.icon} />
-              </div>
-              <span>{app.label}</span>
-            </button>
-          ))}
+          {apps
+            .filter((app) => !app.hidden && app.id !== "home")
+            .map((app) => (
+              <button
+                key={app.id}
+                type="button"
+                className="desktop-icon"
+                onClick={() => openApp(app.id)}
+              >
+                <div
+                  className="desktop-icon-tile"
+                  style={{ background: app.color }}
+                >
+                  <AppGlyph icon={app.icon} />
+                </div>
+                <span>{app.label}</span>
+              </button>
+            ))}
         </section>
       </section>
 
@@ -2622,13 +2916,20 @@ export default function HomePage() {
           }`}
           style={
             windowMode === "normal" && windowPosition
-              ? { left: windowPosition.x, top: windowPosition.y, transform: "none" }
+              ? {
+                  left: windowPosition.x,
+                  top: windowPosition.y,
+                  transform: "none",
+                }
               : undefined
           }
         >
           <div className="window-titlebar" onPointerDown={startWindowDrag}>
             <div className="window-app">
-              <div className="window-app-icon" style={{ background: activeApp.color }}>
+              <div
+                className="window-app-icon"
+                style={{ background: activeApp.color }}
+              >
                 <AppGlyph icon={activeApp.icon} />
               </div>
               <div>
@@ -2638,13 +2939,21 @@ export default function HomePage() {
             </div>
 
             <div className="window-actions">
-              <button type="button" aria-label="Minimize" onClick={() => setWindowMode("minimized")}>
+              <button
+                type="button"
+                aria-label="Minimize"
+                onClick={() => setWindowMode("minimized")}
+              >
                 -
               </button>
               <button
                 type="button"
                 aria-label="Fullscreen"
-                onClick={() => setWindowMode((mode) => (mode === "maximized" ? "normal" : "maximized"))}
+                onClick={() =>
+                  setWindowMode((mode) =>
+                    mode === "maximized" ? "normal" : "maximized",
+                  )
+                }
               >
                 □
               </button>
@@ -2655,11 +2964,25 @@ export default function HomePage() {
           </div>
 
           <div className="window-body">
-            <AppWindowContent app={activeApp} />
+            <AppWindowContent
+              app={activeApp}
+              onOpenStudio={openStudioFlow}
+              onRunFlow={runFlowAsset}
+              onBackToAssets={() => {
+                replaceRouteQuery({ app: "agents", mode: null, flow: null });
+                setActiveAppId("agents");
+                setIsWindowClosed(false);
+                setWindowMode("maximized");
+              }}
+            />
           </div>
         </section>
       ) : activeAppId !== "home" ? (
-        <button type="button" className="window-restore" onClick={() => setIsWindowClosed(false)}>
+        <button
+          type="button"
+          className="window-restore"
+          onClick={() => setIsWindowClosed(false)}
+        >
           重新打开 {activeApp.label}
         </button>
       ) : null}
@@ -2675,24 +2998,29 @@ export default function HomePage() {
         </button>
 
         <div className="dock">
-          {apps.map((app) => {
-            const isActive = activeAppId === app.id && showWindow;
+          {apps
+            .filter((app) => !app.hidden)
+            .map((app) => {
+              const isActive = activeAppId === app.id && showWindow;
 
-            return (
-              <button
-                key={app.id}
-                type="button"
-                className={`dock-item ${isActive ? "is-active" : ""}`}
-                onClick={() => openApp(app.id)}
-                aria-label={app.label}
-              >
-                <div className="dock-item-icon" style={{ background: app.color }}>
-                  <AppGlyph icon={app.icon} />
-                </div>
-                <span className="dock-tooltip">{app.label}</span>
-              </button>
-            );
-          })}
+              return (
+                <button
+                  key={app.id}
+                  type="button"
+                  className={`dock-item ${isActive ? "is-active" : ""}`}
+                  onClick={() => openApp(app.id)}
+                  aria-label={app.label}
+                >
+                  <div
+                    className="dock-item-icon"
+                    style={{ background: app.color }}
+                  >
+                    <AppGlyph icon={app.icon} />
+                  </div>
+                  <span className="dock-tooltip">{app.label}</span>
+                </button>
+              );
+            })}
         </div>
       </div>
     </main>

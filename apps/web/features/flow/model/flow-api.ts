@@ -1,4 +1,4 @@
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:7000/api/v1";
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:7100/api/v1";
 
 type ApiSuccess<T> = {
   success: true;
@@ -126,6 +126,8 @@ export type BackendFlowSummary = {
   description?: string | null;
   flow_type: "agent" | "team";
   status: "draft" | "published" | "archived";
+  is_exposed: boolean;
+  is_primary: boolean;
   latest_version: number;
   created_at?: string | null;
   updated_at?: string | null;
@@ -206,6 +208,27 @@ export function getBackendTeam(teamId: string) {
   return request<BackendTeam>(`/teams/${teamId}`);
 }
 
+export function createBackendAgent(payload: {
+  name: string;
+  description?: string | null;
+  role?: string | null;
+  system_prompt?: string | null;
+  instructions?: string | null;
+  model_config: BackendAgentDetail["model_config"];
+  tool_ids?: string[];
+  skill_ids?: string[];
+  knowledge_ids?: string[];
+  stream?: boolean;
+  debug?: boolean;
+  owner_user_id?: string;
+  workspace_id?: string;
+}) {
+  return request<BackendAgentDetail>("/agents", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function updateBackendAgent(agentId: string, payload: Partial<{
   name: string;
   description: string | null;
@@ -223,12 +246,20 @@ export function updateBackendAgent(agentId: string, payload: Partial<{
   });
 }
 
+export function deleteBackendAgent(agentId: string) {
+  return request<BackendAgentDetail>(`/agents/${agentId}`, {
+    method: "DELETE",
+  });
+}
+
 export function createBackendFlow(payload: {
   name: string;
   description?: string;
   flow_type?: "agent" | "team";
   owner_user_id?: string;
   workspace_id?: string;
+  is_exposed?: boolean;
+  is_primary?: boolean;
   definition: BackendFlowDefinition;
 }) {
   return request<BackendFlow>("/flows", {
@@ -241,11 +272,53 @@ export function updateBackendFlow(flowId: string, payload: {
   name?: string;
   description?: string | null;
   flow_type?: "agent" | "team";
+  is_exposed?: boolean;
+  is_primary?: boolean;
   definition?: BackendFlowDefinition;
 }) {
   return request<BackendFlow>(`/flows/${flowId}`, {
     method: "PUT",
     body: JSON.stringify(payload),
+  });
+}
+
+export function deleteBackendFlow(flowId: string) {
+  return request<BackendFlow>(`/flows/${flowId}`, {
+    method: "DELETE",
+  });
+}
+
+export function createBackendTeam(payload: {
+  name: string;
+  description?: string | null;
+  owner_user_id?: string;
+  workspace_id?: string;
+  strategy?: "parallel" | "sequential";
+  member_agent_ids?: string[];
+  status?: string;
+}) {
+  return request<BackendTeam>("/teams", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateBackendTeam(teamId: string, payload: Partial<{
+  name: string;
+  description: string | null;
+  strategy: "parallel" | "sequential";
+  member_agent_ids: string[];
+  status: string;
+}>) {
+  return request<BackendTeam>(`/teams/${teamId}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteBackendTeam(teamId: string) {
+  return request<BackendTeam>(`/teams/${teamId}`, {
+    method: "DELETE",
   });
 }
 
