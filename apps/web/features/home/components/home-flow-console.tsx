@@ -343,6 +343,7 @@ export function HomeFlowConsole() {
 
     try {
       let streamedResult: BackendRunDetail | null = null;
+      let streamedText = "";
 
       await streamBackendFlowRun(
         selectedFlow.id,
@@ -356,6 +357,22 @@ export function HomeFlowConsole() {
         },
         (event) => {
           setEvents((current) => [...current, event]);
+
+          if (event.event === "token.delta") {
+            const delta =
+              typeof event.data.delta === "string" ? event.data.delta : "";
+            if (delta) {
+              streamedText += delta;
+              const nextText = streamedText;
+              setMessages((current) =>
+                current.map((item) =>
+                  item.id === assistantMessageId
+                    ? { ...item, content: nextText }
+                    : item,
+                ),
+              );
+            }
+          }
 
           if (event.event === "run.completed") {
             streamedResult = event.data as unknown as BackendRunDetail;
