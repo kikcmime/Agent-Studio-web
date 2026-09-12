@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useState } from "react";
 
 import { runBackendFlow, streamBackendFlowRun, type BackendRunDetail, type BackendRunStreamEvent } from "../model/flow-api";
 
@@ -14,12 +14,12 @@ export function useFlowRunState(
   const [isRunStreaming, setIsRunStreaming] = useState(false);
   const [runInputText] = useState('{"user_message":"帮我处理这个问题"}');
 
-  const resetRunState = () => {
+  const resetRunState = useCallback(() => {
     setRunResult(null);
     setRunEvents([]);
-  };
+  }, []);
 
-  const runCurrentFlow = async () => {
+  const runCurrentFlow = useCallback(async () => {
     if (!selectedFlowId) {
       return;
     }
@@ -48,7 +48,7 @@ export function useFlowRunState(
     } finally {
       setIsRunStreaming(false);
     }
-  };
+  }, [resetRunState, runInputText, selectedFlowId, setCanvasNotice, setFlowError]);
 
   return {
     runResult,

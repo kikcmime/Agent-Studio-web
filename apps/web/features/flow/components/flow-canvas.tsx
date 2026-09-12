@@ -25,10 +25,11 @@ export function FlowNodeSelector(props: {
   onClose: () => void;
   onSelect: (kind: FlowStudioNodeKind, sourceNodeId: string) => void;
 }) {
+  const { anchor, onClose, onSelect } = props;
   const [searchText, setSearchText] = useState("");
 
   useEffect(() => {
-    if (!props.anchor) {
+    if (!anchor) {
       return;
     }
 
@@ -36,7 +37,7 @@ export function FlowNodeSelector(props: {
       if (event.target instanceof Element && event.target.closest(".flow-node-selector")) {
         return;
       }
-      props.onClose();
+      onClose();
     };
 
     const timer = window.setTimeout(() => document.addEventListener("mousedown", close), 80);
@@ -44,9 +45,9 @@ export function FlowNodeSelector(props: {
       window.clearTimeout(timer);
       document.removeEventListener("mousedown", close);
     };
-  }, [props]);
+  }, [anchor, onClose]);
 
-  if (!props.anchor) {
+  if (!anchor) {
     return null;
   }
 
@@ -62,13 +63,13 @@ export function FlowNodeSelector(props: {
     <div
       className="flow-node-selector"
       style={{
-        left: `min(${props.anchor.x + 12}px, calc(100% - 274px))`,
-        top: `max(18px, min(${props.anchor.y - 80}px, calc(100% - 360px)))`,
+        left: `min(${anchor.x + 12}px, calc(100% - 274px))`,
+        top: `max(18px, min(${anchor.y - 80}px, calc(100% - 360px)))`,
       }}
     >
       <div className="flow-node-selector-header">
         <strong>添加同级/下级节点</strong>
-        <button type="button" onClick={props.onClose}>
+        <button type="button" onClick={onClose}>
           关闭
         </button>
       </div>
@@ -82,7 +83,7 @@ export function FlowNodeSelector(props: {
           <button
             key={nodeType.kind}
             type="button"
-            onClick={() => props.onSelect(nodeType.kind, props.anchor!.sourceNodeId)}
+            onClick={() => onSelect(nodeType.kind, anchor.sourceNodeId)}
           >
             <span style={{ background: nodeType.color }}>{nodeType.label.slice(0, 1)}</span>
             <strong>{nodeType.label}</strong>
@@ -226,6 +227,7 @@ export function FlowCanvas(props: {
   centerSignal?: number;
 }) {
   const { fitView } = useReactFlow();
+  const expandedTeamNodeIdsKey = props.expandedTeamNodeIds.join("\u0000");
   const centerCanvas = useCallback(() => {
     fitView({
       duration: 300,
@@ -245,7 +247,7 @@ export function FlowCanvas(props: {
         />
       ),
     }),
-    [props.expandedTeamNodeIds, props.onAddNodeClick, props.onDeleteNodeClick, props.onToggleTeamMembers],
+    [expandedTeamNodeIdsKey, props.onAddNodeClick, props.onDeleteNodeClick, props.onToggleTeamMembers],
   );
 
   useEffect(() => {

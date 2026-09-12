@@ -1,7 +1,7 @@
 "use client";
 
 import { addEdge, useEdgesState, useNodesState, type Connection, type Edge, type Node } from "@xyflow/react";
-import { useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 
 import { createTeamWrapperDefinition } from "../../agents/lib/agent-assets";
 import { getFlowStudioNodeConfig, type FlowStudioNodeKind } from "../model/node-config";
@@ -99,7 +99,7 @@ export function useFlowGraphEditor(options: UseFlowGraphEditorOptions) {
     [edges, selectedNodeId],
   );
 
-  const updateSelectedNode = (patch: Partial<StudioNodeData>) => {
+  const updateSelectedNode = useCallback((patch: Partial<StudioNodeData>) => {
     if (!selectedNodeId) {
       return;
     }
@@ -117,9 +117,9 @@ export function useFlowGraphEditor(options: UseFlowGraphEditorOptions) {
           : node,
       ),
     );
-  };
+  }, [selectedNodeId, setNodes]);
 
-  const onConnect = (connection: Connection) => {
+  const onConnect = useCallback((connection: Connection) => {
     const sourceNode = nodes.find((node) => node.id === connection.source);
     const targetNode = nodes.find((node) => node.id === connection.target);
     const isFailureBackflow = Boolean(
@@ -155,9 +155,9 @@ export function useFlowGraphEditor(options: UseFlowGraphEditorOptions) {
       );
       setCanvasNotice("已创建失败回流线");
     }
-  };
+  }, [nodes, setCanvasNotice, setEdges, setNodes]);
 
-  const addNode = (kind: FlowStudioNodeKind, sourceNodeId?: string) => {
+  const addNode = useCallback((kind: FlowStudioNodeKind, sourceNodeId?: string) => {
     if (!selectedFlow) {
       setFlowError("请先从后端创建或打开一个 Flow，再添加节点。");
       return;
@@ -240,15 +240,30 @@ export function useFlowGraphEditor(options: UseFlowGraphEditorOptions) {
     setIsFlowSettingsOpen(false);
     setFocusNodeId(id);
     setCanvasNotice(`${config.label} 节点已添加`);
-  };
+  }, [
+    backendAgents,
+    edges,
+    nodes,
+    selectedFlow,
+    setCanvasNotice,
+    setEdges,
+    setFlowError,
+    setFocusNodeId,
+    setIsFlowSettingsOpen,
+    setNodeSelectorAnchor,
+    setNodes,
+    setSelectedNodeId,
+    teamOptions,
+    updateSelectedFlow,
+  ]);
 
-  const openNodeSelectorFromNode = (sourceNodeId: string, screenPosition: { x: number; y: number }) => {
+  const openNodeSelectorFromNode = useCallback((sourceNodeId: string, screenPosition: { x: number; y: number }) => {
     setSelectedNodeId(sourceNodeId);
     setIsFlowSettingsOpen(false);
     setNodeSelectorAnchor({ sourceNodeId, ...screenPosition });
-  };
+  }, [setIsFlowSettingsOpen, setNodeSelectorAnchor, setSelectedNodeId]);
 
-  const deleteNodeById = (nodeId: string) => {
+  const deleteNodeById = useCallback((nodeId: string) => {
     const targetNode = nodes.find((node) => node.id === nodeId);
 
     if (targetNode?.data.kind === "start") {
@@ -264,15 +279,15 @@ export function useFlowGraphEditor(options: UseFlowGraphEditorOptions) {
       setSelectedNodeId(null);
       setFocusNodeId(null);
     }
-  };
+  }, [nodes, selectedNodeId, setCanvasNotice, setEdges, setFocusNodeId, setNodes, setSelectedNodeId]);
 
-  const deleteSelectedNode = () => {
+  const deleteSelectedNode = useCallback(() => {
     if (!selectedNodeId) {
       return;
     }
 
     deleteNodeById(selectedNodeId);
-  };
+  }, [deleteNodeById, selectedNodeId]);
 
   const previewTeamNode =
     nodes.find((node) => node.id === previewTeamNodeId && node.data.kind === "team") ?? null;
