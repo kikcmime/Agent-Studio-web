@@ -14,11 +14,11 @@ export const initialFlowDefinition: FlowDefinition = {
       position: { x: 360, y: 180 },
       data: {
         label: "Triage Agent",
-        agentBinding: {
-          agentId: "agent_demo",
+        agent_binding: {
+          agent_id: "agent_demo",
         },
-        inputMapping: {},
-        outputMapping: {},
+        input_mapping: {},
+        output_mapping: {},
       },
     },
     {

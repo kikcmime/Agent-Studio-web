@@ -9,6 +9,14 @@ export const stringifyRunOutput = (value: unknown) => {
 
   if (
     typeof value === "object" &&
+    "summary" in value &&
+    typeof value.summary === "string"
+  ) {
+    return value.summary;
+  }
+
+  if (
+    typeof value === "object" &&
     "result" in value &&
     typeof value.result === "string"
   ) {

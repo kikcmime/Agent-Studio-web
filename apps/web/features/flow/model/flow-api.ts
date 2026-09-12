@@ -1,21 +1,14 @@
+import type {
+  ApiResponse,
+  FlowDefinition,
+  FlowNode,
+  FlowSummary,
+  RunDetail,
+  RunStep,
+  TeamSummary,
+} from "@agent-studio/shared";
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:7100/api/v1";
-
-type ApiSuccess<T> = {
-  success: true;
-  data: T;
-  meta?: Record<string, unknown>;
-};
-
-type ApiError = {
-  success: false;
-  error: {
-    code: string;
-    message: string;
-    details?: Record<string, unknown>;
-  };
-};
-
-type ApiResponse<T> = ApiSuccess<T> | ApiError;
 
 export type BackendAgent = {
   id: string;
@@ -43,68 +36,9 @@ export type BackendAgentDetail = BackendAgent & {
   knowledge_ids: string[];
 };
 
-export type BackendTeam = {
-  id: string;
-  name: string;
-  description?: string | null;
-  strategy: "parallel" | "sequential";
-  member_agent_ids: string[];
-  status: string;
-  version?: number;
-  updated_at?: string | null;
-};
+export type BackendTeam = TeamSummary;
 
-export type BackendFlowNode =
-  | {
-      id: string;
-      type: "start";
-      position: { x: number; y: number };
-      data: { label?: string | null };
-    }
-  | {
-      id: string;
-      type: "agent";
-      position: { x: number; y: number };
-      data: {
-        label: string;
-        agent_binding: { agent_id: string; agent_version?: number | null };
-        input_mapping: Record<string, unknown>;
-        output_mapping: Record<string, unknown>;
-        max_retry?: number;
-        on_fail?: string | null;
-      };
-    }
-  | {
-      id: string;
-      type: "team";
-      position: { x: number; y: number };
-      data: {
-        label: string;
-        team_id?: string | null;
-        description?: string | null;
-        member_agent_ids: string[];
-        strategy: "parallel" | "sequential";
-        input_mapping: Record<string, unknown>;
-        output_mapping: Record<string, unknown>;
-        max_retry?: number;
-        on_fail?: string | null;
-      };
-    }
-  | {
-      id: string;
-      type: "condition";
-      position: { x: number; y: number };
-      data: {
-        label: string;
-        condition: { field: string; operator: string; value: unknown };
-      };
-    }
-  | {
-      id: string;
-      type: "end";
-      position: { x: number; y: number };
-      data: { label?: string | null };
-    };
+export type BackendFlowNode = FlowNode;
 
 export type BackendFlowEdge = {
   id: string;
@@ -115,52 +49,17 @@ export type BackendFlowEdge = {
   data?: Record<string, unknown>;
 };
 
-export type BackendFlowDefinition = {
-  nodes: BackendFlowNode[];
-  edges: BackendFlowEdge[];
-};
+export type BackendFlowDefinition = FlowDefinition;
 
-export type BackendFlowSummary = {
-  id: string;
-  name: string;
-  description?: string | null;
-  flow_type: "agent" | "team";
-  status: "draft" | "published" | "archived";
-  is_exposed: boolean;
-  is_primary: boolean;
-  latest_version: number;
-  created_at?: string | null;
-  updated_at?: string | null;
-};
+export type BackendFlowSummary = FlowSummary;
 
 export type BackendFlow = BackendFlowSummary & {
   definition: BackendFlowDefinition;
 };
 
-export type BackendRunStep = {
-  id: string;
-  node_id: string;
-  node_type: string;
-  status: string;
-  input: Record<string, unknown>;
-  output: Record<string, unknown>;
-  error?: string | null;
-};
+export type BackendRunStep = RunStep;
 
-export type BackendRunDetail = {
-  id: string;
-  flow_id: string;
-  flow_version: number;
-  status: string;
-  output: Record<string, unknown>;
-  steps: BackendRunStep[];
-  events?: Array<{
-    id: string;
-    event_type: string;
-    payload: Record<string, unknown>;
-    created_at?: string | null;
-  }>;
-};
+export type BackendRunDetail = RunDetail;
 
 export type BackendRunStreamEvent = {
   event: string;

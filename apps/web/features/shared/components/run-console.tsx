@@ -10,6 +10,7 @@ function trimConsoleText(value: string) {
 function formatRunEventSummary(item: BackendRunStreamEvent) {
   const data = item.data as Record<string, unknown>;
   const output = data.output as Record<string, unknown> | undefined;
+  const delta = typeof data.delta === "string" ? data.delta : "";
 
   if (item.event === "run.started") {
     return `status: ${String(data.status ?? "running")}\nrun: ${String(data.run_id ?? "-")}`;
@@ -28,10 +29,28 @@ function formatRunEventSummary(item: BackendRunStreamEvent) {
   if (item.event === "run.completed") {
     const finalOutput = data.output as Record<string, unknown> | undefined;
     const finalText =
-      typeof finalOutput?.final_text === "string"
-        ? finalOutput.final_text
+      typeof finalOutput?.summary === "string"
+        ? finalOutput.summary
+        : typeof finalOutput?.final_text === "string"
+          ? finalOutput.final_text
         : String(data.status ?? "completed");
     return trimConsoleText(finalText);
+  }
+
+  if (item.event === "token.delta") {
+    return trimConsoleText(delta);
+  }
+
+  if (item.event === "team.member.started") {
+    return `agent: ${String(data.agent_name ?? data.agent_id ?? "-")}`;
+  }
+
+  if (item.event === "team.member.completed") {
+    return `agent: ${String(data.agent_id ?? "-")}\nstatus: ${String(data.status ?? "completed")}`;
+  }
+
+  if (item.event === "team.completed") {
+    return trimConsoleText(typeof output?.message === "string" ? output.message : "team completed");
   }
 
   if (item.event === "step.failed" || item.event === "run.failed") {
@@ -48,7 +67,28 @@ export function RunConsole(props: {
   result: BackendRunDetail | null;
   showResult?: boolean;
 }) {
-  const lastEvent = props.events.at(-1);
+  const renderedEvents = props.events.reduce<BackendRunStreamEvent[]>((items, event) => {
+    if (event.event !== "token.delta") {
+      items.push(event);
+      return items;
+    }
+
+    const previous = items.at(-1);
+    if (previous?.event === "token.delta") {
+      previous.data = {
+        ...previous.data,
+        delta: `${String(previous.data.delta ?? "")}${String(event.data.delta ?? "")}`,
+      };
+      return items;
+    }
+
+    items.push({
+      ...event,
+      data: { ...event.data },
+    });
+    return items;
+  }, []).filter((event) => event.event !== "run.started");
+  const lastEvent = renderedEvents.at(-1);
 
   return (
     <div className="run-console">
@@ -69,10 +109,10 @@ export function RunConsole(props: {
       </div>
 
       <div className="run-console-feed">
-        {props.events.length === 0 ? (
+        {renderedEvents.length === 0 ? (
           <p>点击运行后，这里会显示 run / step / tool / token 等事件流。</p>
         ) : (
-          props.events.map((item, index) => (
+          renderedEvents.map((item, index) => (
             <div key={`${item.event}_${index}`} className="run-console-event">
               <span>{item.event}</span>
               <pre>{formatRunEventSummary(item)}</pre>
